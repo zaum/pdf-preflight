@@ -1,0 +1,675 @@
+import numpy as np
+import re
+
+
+class OverprintPreview:
+    def detect_overprint(self, page):
+        try:
+            pag_obj = page.parent.xref_object(page.xref)
+            if '/ExtGState' in pag_obj:
+                egc = pag_obj.split('/ExtGState')[1]
+                if '/OP' in egc or '/op' in egc:
+                    return True
+        except Exception:
+            pass
+        try:
+            for xref_i in range(1, page.parent.xref_length()):
+                obj = page.parent.xref_object(xref_i)
+                if '/Type' in obj and '/ExtGState' in obj:
+                    if '/OP' in obj or '/op' in obj:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def simulate(self, cmyk_arr, page):
+        if cmyk_arr is None:
+            return None, False
+        has_op = self.detect_overprint(page)
+        return cmyk_arr.copy(), has_op
+
+
+def _get_extgstate_overprints(doc, page):
+    """Parse page /Resources -> /ExtGState and return {name: (has_OP, op_val, has_op, op_val)}.
+
+    Returns a dict where each value is (has_OP, OP_value, has_op, op_value).
+    has_OP/has_op are True if the ExtGState explicitly sets /OP or /op.
+    OP_value/op_value are the boolean values.
+
+    This is important: in PDF, if an ExtGState doesn't include /OP, the current
+    overprint fill flag is UNCHANGED. Same for /op and stroke."""
+    try:
+        page_obj = doc.xref_object(page.xref)
+    except Exception:
+        return {}
+
+    resources_str = None
+    m_res = re.search(r'/Resources\s+<<(.*?)>>', page_obj, re.DOTALL)
+    if m_res:
+        resources_str = m_res.group(1)
+    else:
+        m_ref = re.search(r'/Resources\s+(\d+)\s+0\s+R', page_obj)
+        if m_ref:
+            res_xref = int(m_ref.group(1))
+            try:
+                res_obj = doc.xref_object(res_xref)
+            except Exception:
+                return {}
+            m_res2 = re.search(r'/ExtGState\s*<<(.*?)>>', res_obj, re.DOTALL)
+            if m_res2:
+                resources_str = m_res2.group(1)
+
+    if not resources_str:
+        all_text = page_obj
+        m_ref = re.search(r'/Resources\s+(\d+)\s+0\s+R', page_obj)
+        if m_ref:
+            try:
+                all_text += doc.xref_object(int(m_ref.group(1)))
+            except Exception:
+                pass
+        m_eg = re.search(r'/ExtGState\s*<<(.*?)>>', all_text, re.DOTALL)
+        if m_eg:
+            resources_str = m_eg.group(1)
+        else:
+            return {}
+
+    entries = re.findall(r'/(\w+)\s+(\d+)\s+0\s+R', resources_str)
+    result = {}
+    for name, xref_str in entries:
+        xref = int(xref_str)
+        try:
+            obj = doc.xref_object(xref)
+        except Exception:
+            continue
+        has_OP = '/OP' in obj
+        has_op = '/op' in obj
+        if has_OP or has_op:
+            op_fill = '/OP true' in obj if has_OP else None
+            op_stroke = '/op true' in obj if has_op else None
+            result[name] = (has_OP, op_fill, has_op, op_stroke)
+    return result
+
+
+def _parse_content_sequence(doc, page):
+    """Parse the page content stream(s) and return a list of operations in order.
+    
+    Each operation is a dict with keys:
+      type: 'path_fill', 'path_stroke', 'path_fs', 'text'
+      fill_color: DeviceCMYK tuple (c,m,y,k) 0-1, or None
+      stroke_color: DeviceCMYK tuple or None  
+      overprint_fill: bool
+      overprint_stroke: bool
+      index: sequence number for correlation with get_cdrawings
+    """
+    from preview.content_stream import _tokenize
+
+    op_gs = _get_extgstate_overprints(doc, page)
+    if not op_gs:
+        return []
+
+    page_height = page.rect.height
+    xrefs = page.get_contents()
+    if not xrefs:
+        return []
+
+    gs = {
+        'fill_cs': 'DeviceGray',
+        'fill_color': (0,),
+        'stroke_cs': 'DeviceGray',
+        'stroke_color': (0,),
+        'overprint_fill': False,
+        'overprint_stroke': False,
+    }
+    gs_stack = []
+
+    tm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    tlm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    font_size = 0.0
+    leading = 0.0
+
+    operations = []
+
+    for xri in xrefs:
+        stream = doc.xref_stream(xri)
+        if not stream:
+            continue
+        tokens = _tokenize(stream)
+        pos = 0
+        n = len(tokens)
+
+        def _pop(count):
+            nonlocal pos
+            r = []
+            j = pos - 1
+            found = 0
+            while j >= 0 and found < count:
+                t = tokens[j]
+                if isinstance(t, (int, float)):
+                    r.insert(0, float(t))
+                    found += 1
+                elif isinstance(t, str) and t.startswith('/'):
+                    r.insert(0, t)
+                    found += 1
+                elif t == ']':
+                    depth = 1
+                    j -= 1
+                    while j >= 0 and depth > 0:
+                        if tokens[j] == ']':
+                            depth += 1
+                        elif tokens[j] == '[':
+                            depth -= 1
+                        j -= 1
+                    continue
+                elif t == '[':
+                    j -= 1
+                    continue
+                else:
+                    break
+                j -= 1
+            return r
+
+        def _cmyk_color(fill_color, fill_cs):
+            """Convert to DeviceCMYK tuple (c,m,y,k) 0-1."""
+            if fill_cs == 'DeviceCMYK' and len(fill_color) >= 4:
+                return tuple(float(v) for v in fill_color[:4])
+            elif fill_cs == 'DeviceGray' and len(fill_color) >= 1:
+                return (0.0, 0.0, 0.0, 1.0 - float(fill_color[0]))
+            elif fill_cs == 'DeviceRGB' and len(fill_color) >= 3:
+                r, g, b = float(fill_color[0]), float(fill_color[1]), float(fill_color[2])
+                k = 1.0 - max(r, g, b)
+                if k >= 1.0:
+                    return (0.0, 0.0, 0.0, 1.0)
+                c = (1.0 - r - k) / (1.0 - k) if (1.0 - k) > 0 else 0.0
+                m = (1.0 - g - k) / (1.0 - k) if (1.0 - k) > 0 else 0.0
+                y = (1.0 - b - k) / (1.0 - k) if (1.0 - k) > 0 else 0.0
+                return (c, m, y, k)
+            return None
+
+        while pos < n:
+            tok = tokens[pos]
+
+            if tok == 'q':
+                gs_stack.append(dict(gs))
+                pos += 1
+                continue
+            if tok == 'Q':
+                if gs_stack:
+                    gs = gs_stack.pop()
+                pos += 1
+                continue
+
+            # ExtGState
+            if tok == 'gs':
+                ops = _pop(1)
+                if ops and isinstance(ops[0], str) and ops[0].startswith('/'):
+                    name = ops[0][1:]
+                    if name in op_gs:
+                        has_OP, op_fill, has_op, op_stroke = op_gs[name]
+                        if has_OP:
+                            gs['overprint_fill'] = op_fill
+                        if has_op:
+                            gs['overprint_stroke'] = op_stroke
+                    # If name not in op_gs, ExtGState has no /OP or /op — keep current flags
+                pos += 1
+                continue
+
+            # Fill color
+            if tok == 'k':
+                ops = _pop(4)
+                if len(ops) >= 4 and all(isinstance(o, (int, float)) for o in ops[:4]):
+                    gs['fill_cs'] = 'DeviceCMYK'
+                    gs['fill_color'] = tuple(ops[:4])
+                pos += 1
+                continue
+            if tok == 'rg':
+                ops = _pop(3)
+                if len(ops) >= 3 and all(isinstance(o, (int, float)) for o in ops[:3]):
+                    gs['fill_cs'] = 'DeviceRGB'
+                    gs['fill_color'] = tuple(ops[:3])
+                pos += 1
+                continue
+            if tok == 'g':
+                ops = _pop(1)
+                if len(ops) >= 1 and isinstance(ops[0], (int, float)):
+                    gs['fill_cs'] = 'DeviceGray'
+                    gs['fill_color'] = (ops[0],)
+                pos += 1
+                continue
+            # sc / scn — set fill color in current colorspace
+            if tok in ('sc', 'scn'):
+                if gs['fill_cs'] == 'DeviceGray':
+                    ops = _pop(1)
+                elif gs['fill_cs'] == 'DeviceRGB':
+                    ops = _pop(3)
+                elif gs['fill_cs'] == 'DeviceCMYK':
+                    ops = _pop(4)
+                else:
+                    # Spot color or unknown — mark as spot, skip for overprint
+                    gs['fill_cs'] = 'Spot'
+                    gs['fill_color'] = None
+                    pos += 1
+                    continue
+                if ops and all(isinstance(o, (int, float)) for o in ops):
+                    gs['fill_color'] = tuple(ops)
+                pos += 1
+                continue
+
+            # Stroke color
+            if tok == 'K':
+                ops = _pop(4)
+                if len(ops) >= 4 and all(isinstance(o, (int, float)) for o in ops[:4]):
+                    gs['stroke_cs'] = 'DeviceCMYK'
+                    gs['stroke_color'] = tuple(ops[:4])
+                pos += 1
+                continue
+            if tok == 'RG':
+                ops = _pop(3)
+                if len(ops) >= 3 and all(isinstance(o, (int, float)) for o in ops[:3]):
+                    gs['stroke_cs'] = 'DeviceRGB'
+                    gs['stroke_color'] = tuple(ops[:3])
+                pos += 1
+                continue
+            if tok == 'G':
+                ops = _pop(1)
+                if len(ops) >= 1 and isinstance(ops[0], (int, float)):
+                    gs['stroke_cs'] = 'DeviceGray'
+                    gs['stroke_color'] = (ops[0],)
+                pos += 1
+                continue
+            # SC / SCN — set stroke color in current colorspace
+            if tok in ('SC', 'SCN'):
+                if gs['stroke_cs'] == 'DeviceGray':
+                    ops = _pop(1)
+                elif gs['stroke_cs'] == 'DeviceRGB':
+                    ops = _pop(3)
+                elif gs['stroke_cs'] == 'DeviceCMYK':
+                    ops = _pop(4)
+                else:
+                    gs['stroke_cs'] = 'Spot'
+                    gs['stroke_color'] = None
+                    pos += 1
+                    continue
+                if ops and all(isinstance(o, (int, float)) for o in ops):
+                    gs['stroke_color'] = tuple(ops)
+                pos += 1
+                continue
+
+            # Colorspace names
+            if tok == 'cs':
+                ops = _pop(1)
+                if ops and isinstance(ops[0], str):
+                    if ops[0] == '/DeviceCMYK':
+                        gs['fill_cs'] = 'DeviceCMYK'
+                    elif ops[0] == '/DeviceRGB':
+                        gs['fill_cs'] = 'DeviceRGB'
+                    elif ops[0] == '/DeviceGray':
+                        gs['fill_cs'] = 'DeviceGray'
+                    else:
+                        gs['fill_cs'] = 'Spot'
+                        gs['fill_color'] = None
+                pos += 1
+                continue
+            if tok == 'CS':
+                ops = _pop(1)
+                if ops and isinstance(ops[0], str):
+                    if ops[0] == '/DeviceCMYK':
+                        gs['stroke_cs'] = 'DeviceCMYK'
+                    elif ops[0] == '/DeviceRGB':
+                        gs['stroke_cs'] = 'DeviceRGB'
+                    elif ops[0] == '/DeviceGray':
+                        gs['stroke_cs'] = 'DeviceGray'
+                    else:
+                        gs['stroke_cs'] = 'Spot'
+                        gs['stroke_color'] = None
+                pos += 1
+                continue
+
+            # Text state
+            if tok == 'BT':
+                tm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+                tlm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+                pos += 1
+                continue
+            if tok == 'ET':
+                pos += 1
+                continue
+            if tok == 'Tm':
+                ops = _pop(6)
+                if len(ops) >= 6:
+                    tm = list(ops[:6])
+                    tlm = list(ops[:6])
+                pos += 1
+                continue
+            if tok == 'Td':
+                ops = _pop(2)
+                if len(ops) >= 2:
+                    tlm[4] += ops[0]
+                    tlm[5] += ops[1]
+                    tm = list(tlm)
+                pos += 1
+                continue
+            if tok == 'TD':
+                ops = _pop(2)
+                if len(ops) >= 2:
+                    leading = -ops[1]
+                    tlm[4] += ops[0]
+                    tlm[5] += ops[1]
+                    tm = list(tlm)
+                pos += 1
+                continue
+            if tok == 'T*':
+                tlm[5] = tlm[5] - leading
+                tm = list(tlm)
+                pos += 1
+                continue
+            if tok == 'Tf':
+                ops = _pop(2)
+                if len(ops) >= 2:
+                    font_size = float(ops[1])
+                pos += 1
+                continue
+
+            # Text showing
+            if tok in ('Tj', 'TJ', "'", '"'):
+                cmyk = _cmyk_color(gs['fill_color'], gs['fill_cs'])
+                if cmyk:
+                    operations.append({
+                        'type': 'text',
+                        'fill_color': cmyk,
+                        'overprint_fill': gs['overprint_fill'],
+                        'overprint_stroke': gs['overprint_stroke'],
+                        'x': tm[4],
+                        'y': tm[5],
+                        'font_size': font_size,
+                    })
+                if tok == 'TJ':
+                    tm[4] += font_size * 0.5
+                elif tok == 'Tj':
+                    tm[4] += font_size * 0.5
+                pos += 1
+                continue
+
+            # Path painting – correlate with get_cdrawings by order
+            if tok in ('f', 'F', 'f*'):
+                cmyk = _cmyk_color(gs['fill_color'], gs['fill_cs'])
+                operations.append({
+                    'type': 'path_fill',
+                    'fill_color': cmyk,
+                    'stroke_color': None,
+                    'overprint_fill': gs['overprint_fill'],
+                    'overprint_stroke': gs['overprint_stroke'],
+                })
+                pos += 1
+                continue
+            if tok in ('S', 's'):
+                cmyk = _cmyk_color(gs['stroke_color'], gs['stroke_cs'])
+                operations.append({
+                    'type': 'path_stroke',
+                    'fill_color': None,
+                    'stroke_color': cmyk,
+                    'overprint_fill': gs['overprint_fill'],
+                    'overprint_stroke': gs['overprint_stroke'],
+                })
+                pos += 1
+                continue
+            if tok in ('B', 'B*', 'b', 'b*'):
+                fc = _cmyk_color(gs['fill_color'], gs['fill_cs'])
+                sc = _cmyk_color(gs['stroke_color'], gs['stroke_cs'])
+                operations.append({
+                    'type': 'path_fs',
+                    'fill_color': fc,
+                    'stroke_color': sc,
+                    'overprint_fill': gs['overprint_fill'],
+                    'overprint_stroke': gs['overprint_stroke'],
+                })
+                pos += 1
+                continue
+
+            if tok == 'n':
+                # End path without painting — no color to record but consume sequence
+                pos += 1
+                continue
+
+            pos += 1
+
+    return operations
+
+
+def simulate_overprint_on_cmyk(cmyk_arr, page, doc):
+    """Overprint simulation for separation preview.
+
+    Uses page.get_cdrawings() for precise path geometry and content stream
+    parsing for CMYK colors and overprint flags. Blends per-channel using
+    max(fg, bg) where overprint is active.
+    """
+    if cmyk_arr is None or cmyk_arr.size == 0:
+        return cmyk_arr
+
+    # Parse operations from content stream
+    operations = _parse_content_sequence(doc, page)
+    if not operations:
+        return cmyk_arr.copy()
+
+    # Get drawings for geometry (rgb colors, but we use cs parser for cmyk)
+    try:
+        drawings = page.get_cdrawings()
+    except Exception:
+        drawings = []
+
+    page_height = page.rect.height
+
+    # Determine zoom factor of the input cmyk_arr
+    zoom = cmyk_arr.shape[0] / page_height if page_height > 0 else 1.0
+    h, w = cmyk_arr.shape[:2]
+
+    # Build overprint canvas from scratch (blank page).
+    # All objects composited in original content stream order (z-order).
+    # Knockout: replace channels. Overprint: per-channel max.
+    result = np.zeros_like(cmyk_arr, dtype=np.float32)
+
+    # Track drawing index for path correlation
+    drawing_idx = 0
+
+    for op in operations:
+        if op['type'].startswith('path'):
+            if drawing_idx >= len(drawings):
+                drawing_idx += 1
+                continue
+            d = drawings[drawing_idx]
+            drawing_idx += 1
+
+            fc = op.get('fill_color')
+            sc = op.get('stroke_color')
+            if fc is None and sc is None:
+                continue
+
+            r = d.get('rect')
+            if r is None:
+                continue
+            if hasattr(r, 'x0'):
+                rx0, ry0, rx1, ry1 = r.x0, r.y0, r.x1, r.y1
+            else:
+                rx0, ry0, rx1, ry1 = r[0], r[1], r[2], r[3]
+
+            x0 = int(max(0, rx0 * zoom))
+            x1 = int(min(w, rx1 * zoom))
+            # get_cdrawings rect is already top-down, same as pixmap coordinates
+            y0 = int(max(0, ry0 * zoom))
+            y1 = int(min(h, ry1 * zoom))
+
+            if x0 >= x1 or y0 >= y1:
+                continue
+
+            region = result[y0:y1, x0:x1]
+
+            if fc and len(fc) >= 4:
+                for ch in range(4):
+                    fg_val = float(fc[ch]) * 255.0
+                    if op.get('overprint_fill'):
+                        if fg_val > 0:
+                            np.maximum(region[:, :, ch], fg_val, out=region[:, :, ch])
+                    else:
+                        region[:, :, ch] = fg_val
+
+            if sc and len(sc) >= 4:
+                for ch in range(4):
+                    fg_val = float(sc[ch]) * 255.0
+                    if op.get('overprint_stroke'):
+                        if fg_val > 0:
+                            np.maximum(region[:, :, ch], fg_val, out=region[:, :, ch])
+                    else:
+                        region[:, :, ch] = fg_val
+
+        elif op['type'] == 'text':
+            fc = op.get('fill_color')
+            if not fc or len(fc) < 4:
+                continue
+
+            x_px = int(op.get('x', 0) * zoom)
+            y_bu = op.get('y', 0)
+            y_px = int((page_height - y_bu) * zoom)
+            fs = op.get('font_size', 12) * zoom
+
+            tx0 = max(0, x_px)
+            tx1 = min(w, int(x_px + fs * 3))
+            ty0 = max(0, int(y_px - fs * 1.2))
+            ty1 = min(h, int(y_px + fs * 0.3))
+
+            if tx0 >= tx1 or ty0 >= ty1:
+                continue
+
+            region = result[ty0:ty1, tx0:tx1]
+            has_overprint = op.get('overprint_fill')
+
+            for ch in range(4):
+                fg_val = float(fc[ch]) * 255.0
+                if has_overprint:
+                    if fg_val > 0:
+                        np.maximum(region[:, :, ch], fg_val, out=region[:, :, ch])
+                else:
+                    region[:, :, ch] = fg_val
+
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+# --- Overprint position cache for fast cursor lookup ---
+
+_OP_MAP_CACHE = {}
+
+
+def clear_overprint_cache():
+    _OP_MAP_CACHE.clear()
+
+
+def build_overprint_position_map(doc, page):
+    """Build a list of {bbox, op_fill, op_stroke} entries for overprint objects.
+
+    Correlates content stream operations with get_cdrawings() (paths) and
+    get_text('rawdict') (text) to produce bounding boxes with overprint flags.
+    The bbox is in PyMuPDF top-down coordinates (same as get_text / get_cdrawings).
+    """
+    key = (id(doc), page.xref)
+    if key in _OP_MAP_CACHE:
+        return _OP_MAP_CACHE[key]
+
+    operations = _parse_content_sequence(doc, page)
+    if not operations:
+        _OP_MAP_CACHE[key] = []
+        return []
+
+    try:
+        drawings = page.get_cdrawings()
+    except Exception:
+        drawings = []
+    try:
+        td = page.get_text("rawdict")
+        text_spans = []
+        for block in td.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text_spans.append(span)
+    except Exception:
+        text_spans = []
+
+    result = []
+    drawing_idx = 0
+    text_idx = 0
+
+    for op in operations:
+        if op['type'].startswith('path'):
+            if drawing_idx >= len(drawings):
+                drawing_idx += 1
+                continue
+            d = drawings[drawing_idx]
+            drawing_idx += 1
+
+            r = d.get('rect')
+            if r is None:
+                continue
+            if hasattr(r, 'x0'):
+                bbox = (r.x0, r.y0, r.x1, r.y1)
+            else:
+                bbox = (r[0], r[1], r[2], r[3])
+
+            op_fill = op.get('overprint_fill', False)
+            op_stroke = op.get('overprint_stroke', False)
+
+            # Filter based on operation type — a fill-only operation
+            # shouldn't show stroke overprint, and vice versa.
+            if op['type'] == 'path_fill':
+                op_stroke = False
+            elif op['type'] == 'path_stroke':
+                op_fill = False
+            elif op['type'] == 'text':
+                op_stroke = False
+
+            if op_fill or op_stroke:
+                # Filter out entries with bbox covering >50% of page area
+                # (e.g. combined trim marks or registration mark groups)
+                bw = bbox[2] - bbox[0]
+                bh = bbox[3] - bbox[1]
+                pw = page.rect.width
+                ph = page.rect.height
+                if bw * bh > 0.5 * pw * ph:
+                    continue
+                result.append({
+                    'bbox': bbox,
+                    'op_fill': op_fill,
+                    'op_stroke': op_stroke,
+                })
+
+        elif op['type'] == 'text':
+            op_fill = op.get('overprint_fill', False)
+            if not op_fill:
+                continue
+            if text_idx < len(text_spans):
+                span = text_spans[text_idx]
+                text_idx += 1
+                result.append({
+                    'bbox': tuple(span['bbox']),
+                    'op_fill': True,
+                    'op_stroke': False,
+                })
+
+    _OP_MAP_CACHE[key] = result
+    return result
+
+
+def check_overprint_at(doc, page, pdf_x, pdf_y):
+    """Check if a PDF position is on an overprint object.
+
+    Returns dict: {'overprint': False} or {'overprint': True, 'fill': bool, 'stroke': bool}
+    The fill/stroke flags reflect the CURRENT ExtGState at that position,
+    not filtered by operation type (so the UI can decide what to show)."""
+    op_map = build_overprint_position_map(doc, page)
+    for entry in op_map:
+        bbox = entry['bbox']
+        if bbox[0] <= pdf_x <= bbox[2] and bbox[1] <= pdf_y <= bbox[3]:
+            return {
+                'overprint': True,
+                'fill': entry['op_fill'],
+                'stroke': entry['op_stroke'],
+            }
+    return {'overprint': False}

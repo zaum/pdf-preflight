@@ -1,0 +1,12 @@
+- name: Total Ink Coverage
+  max: 300
+
+- name: Spot Color Check
+  allowed:
+    - Pantone 185 C
+
+- name: Overprint Warning
+  enabled: true
+
+- name: Trim Box Inside Media Box
+  enabled: true

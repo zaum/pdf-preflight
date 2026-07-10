@@ -1,0 +1,15 @@
+[project]
+name = "pdf-preflight"
+version = "0.1.0"
+description = "PDF Preflight Viewer - overprint, separation, color picker, page boxes"
+requires-python = ">=3.10"
+dependencies = [
+    "PyMuPDF>=1.26.0",
+    "PyQt6>=6.7.0",
+    "numpy>=1.26.0",
+    "PyYAML>=6.0",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+pdf-preflight = "src.pdfpreflight.__main__:main"
