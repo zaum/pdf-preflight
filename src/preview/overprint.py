@@ -1,6 +1,8 @@
 import numpy as np
 import re
 
+import fitz
+
 
 class OverprintPreview:
     def detect_overprint(self, page):
@@ -435,12 +437,127 @@ def _parse_content_sequence(doc, page):
     return operations
 
 
-def simulate_overprint_on_cmyk(cmyk_arr, page, doc):
-    """Overprint simulation for separation preview.
+def _resize_to(arr, th, tw):
+    if arr.shape[0] == th and arr.shape[1] == tw:
+        return arr
+    ys = (np.arange(th) * (arr.shape[0] / th)).astype(np.intp)
+    xs = (np.arange(tw) * (arr.shape[1] / tw)).astype(np.intp)
+    return arr[np.ix_(ys, xs)]
+
+
+def _pt(v, ox, oy):
+    """Convert a point-ish value (fitz.Point or (x, y) tuple) to a local Point."""
+    if hasattr(v, 'x'):
+        return fitz.Point(v.x - ox, v.y - oy)
+    return fitz.Point(v[0] - ox, v[1] - oy)
+
+
+_MASK_CACHE = {}
+
+
+def _drawing_coverage_mask(d, zoom, cache_key, target_w=None, target_h=None):
+    """Return a float32 [H, W] coverage mask (0..1) of the drawing's painted
+    area (fill and/or stroke), rasterized with accurate path geometry.
+
+    The mask is rendered for the drawing's bounding box and scaled to exactly
+    ``(target_h, target_w)`` pixels so it aligns pixel-for-pixel with the
+    region slice it will be composited into. Returns None on failure, in which
+    case the caller should fall back to the bounding box.
+
+    ``cache_key`` must be stable across renders of the same drawing/zoom
+    (e.g. (id(doc), page.xref, seqno, zoom)) -- ``d`` itself is recreated on
+    every ``get_cdrawings`` call, so its ``id`` must not be used for caching."""
+    key = cache_key
+    cached = _MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    r = d.get('rect')
+    if r is None:
+        _MASK_CACHE[key] = None
+        return None
+    if hasattr(r, 'x0'):
+        x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
+    else:
+        x0, y0, x1, y1 = r[0], r[1], r[2], r[3]
+    bw = x1 - x0
+    bh = y1 - y0
+    if bw <= 0 or bh <= 0:
+        _MASK_CACHE[key] = None
+        return None
+    if d.get('fill') is None and d.get('stroke') is None:
+        _MASK_CACHE[key] = None
+        return None
+
+    try:
+        tmp = fitz.open()
+        pg = tmp.new_page(width=bw, height=bh)
+        sh = pg.new_shape()
+        ok = False
+        for it in d.get('items', []):
+            t = it[0]
+            if t == 're':
+                rr = it[1]
+                if hasattr(rr, 'x0'):
+                    sh.draw_rect(fitz.Rect(rr.x0 - x0, rr.y0 - y0,
+                                           rr.x1 - x0, rr.y1 - y0))
+                else:
+                    sh.draw_rect(fitz.Rect(rr[0] - x0, rr[1] - y0,
+                                           rr[2] - x0, rr[3] - y0))
+                ok = True
+            elif t == 'l':
+                p1, p2 = it[1], it[2]
+                sh.draw_line(_pt(p1, x0, y0), _pt(p2, x0, y0))
+                ok = True
+            elif t == 'c':
+                p1, p2, p3, p4 = it[1], it[2], it[3], it[4]
+                sh.draw_bezier(_pt(p1, x0, y0), _pt(p2, x0, y0),
+                               _pt(p3, x0, y0), _pt(p4, x0, y0))
+                ok = True
+        if not ok:
+            tmp.close()
+            _MASK_CACHE[key] = None
+            return None
+        sh.finish(
+            fill=(1.0, 0.0, 0.0) if d.get('fill') is not None else None,
+            color=(1.0, 0.0, 0.0) if d.get('stroke') is not None else None,
+            width=(d.get('width') or 1.0),
+            closePath=bool(d.get('closePath', False)),
+            even_odd=bool(d.get('even_odd', False)),
+        )
+        sh.commit()
+        # Render the mask at the SAME zoom as the main pixmap so its pixel grid
+        # is identical to cmyk_arr (both use Matrix(zoom) over the same global
+        # origin). Scaling the bbox to an exact region size with a different
+        # matrix drifts by whole pixels on large drawings. The caller crops the
+        # result to the exact region slice.
+        mat = fitz.Matrix(zoom, zoom)
+        pm = pg.get_pixmap(matrix=mat, alpha=True)
+        tmp.close()
+    except Exception:
+        _MASK_CACHE[key] = None
+        return None
+
+    if pm.n < 4 or pm.height == 0 or pm.width == 0:
+        _MASK_CACHE[key] = None
+        return None
+    alpha = np.frombuffer(pm.samples, dtype=np.uint8)
+    alpha = alpha.reshape(pm.height, pm.width, pm.n)[:, :, 3].astype(np.float32) / 255.0
+    _MASK_CACHE[key] = alpha
+    return alpha
+
+
+def simulate_overprint_on_cmyk(cmyk_arr, page, doc, active_channels=None):
+    """Overprint simulation for separation / overprint preview.
 
     Uses page.get_cdrawings() for precise path geometry and content stream
     parsing for CMYK colors and overprint flags. Blends per-channel using
-    max(fg, bg) where overprint is active.
+    max(fg, bg) where overprint is active (compositing in content-stream order,
+    which correctly handles "overprint on top").
+
+    ``active_channels`` (dict cyan/magenta/yellow/black -> bool) optionally
+    masks the result to the requested separation plates so that overprint
+    simulation does not destroy a separation channel selection.
     """
     if cmyk_arr is None or cmyk_arr.size == 0:
         return cmyk_arr
@@ -450,11 +567,15 @@ def simulate_overprint_on_cmyk(cmyk_arr, page, doc):
     if not operations:
         return cmyk_arr.copy()
 
-    # Get drawings for geometry (rgb colors, but we use cs parser for cmyk)
+    # Get drawings for geometry (rgb colors, but we use cs parser for cmyk).
+    # Only keep drawings that actually paint (fill or stroke); clip-only
+    # paths have neither and must not consume a paint-operation slot.
     try:
-        drawings = page.get_cdrawings()
+        raw_drawings = page.get_cdrawings()
     except Exception:
-        drawings = []
+        raw_drawings = []
+    drawings = [d for d in raw_drawings
+                if d.get('fill') is not None or d.get('stroke') is not None]
 
     page_height = page.rect.height
 
@@ -491,47 +612,73 @@ def simulate_overprint_on_cmyk(cmyk_arr, page, doc):
             else:
                 rx0, ry0, rx1, ry1 = r[0], r[1], r[2], r[3]
 
-            x0 = int(max(0, rx0 * zoom))
-            x1 = int(min(w, rx1 * zoom))
-            # get_cdrawings rect is already top-down, same as pixmap coordinates
-            y0 = int(max(0, ry0 * zoom))
-            y1 = int(min(h, ry1 * zoom))
+            # Align the region origin with MuPDF's get_pixmap pixel grid: that
+            # function rounds (not floors) PDF coordinates to pixels, so we must
+            # use round() here too. Otherwise the simulated overprint layer is
+            # offset by up to one pixel relative to the knockout render.
+            x0 = int(max(0, min(w, round(rx0 * zoom))))
+            x1 = int(max(0, min(w, round(rx1 * zoom))))
+            y0 = int(max(0, min(h, round(ry0 * zoom))))
+            y1 = int(max(0, min(h, round(ry1 * zoom))))
 
             if x0 >= x1 or y0 >= y1:
                 continue
 
             region = result[y0:y1, x0:x1]
 
-            if fc and len(fc) >= 4:
-                for ch in range(4):
-                    fg_val = float(fc[ch]) * 255.0
-                    if op.get('overprint_fill'):
-                        if fg_val > 0:
-                            np.maximum(region[:, :, ch], fg_val, out=region[:, :, ch])
-                    else:
-                        region[:, :, ch] = fg_val
+            op_fill = op.get('overprint_fill')
+            op_stroke = op.get('overprint_stroke')
+            is_overprint = bool(op_fill or op_stroke)
 
-            if sc and len(sc) >= 4:
-                for ch in range(4):
-                    fg_val = float(sc[ch]) * 255.0
-                    if op.get('overprint_stroke'):
-                        if fg_val > 0:
-                            np.maximum(region[:, :, ch], fg_val, out=region[:, :, ch])
-                    else:
-                        region[:, :, ch] = fg_val
+            # Every painted object needs its true path geometry, not its
+            # bounding box -- otherwise shapes would render as filled squares
+            # and their edges would appear shifted. Non-overprint objects are
+            # composited knockout (replace inside the shape); overprint objects
+            # are composited additively (max) so they add ink on top of the
+            # layer already built below them.
+            seqno = d.get('seqno', drawing_idx)
+            region_w = x1 - x0
+            region_h = y1 - y0
+            cache_key = (id(doc), page.xref, seqno, region_w, region_h)
+            mask = _drawing_coverage_mask(
+                d, zoom, cache_key, target_w=region_w, target_h=region_h)
+            if mask is not None:
+                # The mask is rendered at the same zoom, so its pixel grid
+                # matches cmyk_arr: mask[y, x] maps to global page pixel
+                # (y0 + y, x0 + x). Crop to the exact region and pad if the
+                # rounded mask is one pixel smaller than the region slice.
+                cov = mask[0:region_h, 0:region_w]
+                if cov.shape[0] < region_h or cov.shape[1] < region_w:
+                    padded = np.zeros((region_h, region_w), dtype=np.float32)
+                    padded[0:cov.shape[0], 0:cov.shape[1]] = cov
+                    cov = padded
+            else:
+                cov = 1.0
+
+            for ch in range(4):
+                fc_v = float(fc[ch]) * 255.0 if (fc and len(fc) >= 4) else 0.0
+                sc_v = float(sc[ch]) * 255.0 if (sc and len(sc) >= 4) else 0.0
+                fg = max(fc_v, sc_v)
+                if fg <= 0:
+                    continue
+                if is_overprint:
+                    np.maximum(region[:, :, ch], fg * cov,
+                               out=region[:, :, ch])
+                else:
+                    region[:, :, ch] = fg * cov + region[:, :, ch] * (1.0 - cov)
 
         elif op['type'] == 'text':
             fc = op.get('fill_color')
             if not fc or len(fc) < 4:
                 continue
 
-            x_px = int(op.get('x', 0) * zoom)
+            x_px = int(round(op.get('x', 0) * zoom))
             y_bu = op.get('y', 0)
-            y_px = int((page_height - y_bu) * zoom)
+            y_px = int(round((page_height - y_bu) * zoom))
             fs = op.get('font_size', 12) * zoom
 
             tx0 = max(0, x_px)
-            tx1 = min(w, int(x_px + fs * 3))
+            tx1 = min(w, int(x_px + max(fs * 3, 1)))
             ty0 = max(0, int(y_px - fs * 1.2))
             ty1 = min(h, int(y_px + fs * 0.3))
 
@@ -539,16 +686,25 @@ def simulate_overprint_on_cmyk(cmyk_arr, page, doc):
                 continue
 
             region = result[ty0:ty1, tx0:tx1]
-            has_overprint = op.get('overprint_fill')
+            # Use the real knockout-rendered glyphs (correct geometry) as the
+            # ink layer instead of filling the bounding box -- otherwise text
+            # would appear as a solid rectangle. For overprint the glyph ink is
+            # added (max) on top of whatever was already composited below; for
+            # knockout it simply replaces. The final global max with cmyk_arr
+            # below restores any glyphs that fell outside this loose bbox.
+            src = cmyk_arr[ty0:ty1, tx0:tx1].astype(np.float32)
+            np.maximum(region, src, out=region)
 
-            for ch in range(4):
-                fg_val = float(fc[ch]) * 255.0
-                if has_overprint:
-                    if fg_val > 0:
-                        np.maximum(region[:, :, ch], fg_val, out=region[:, :, ch])
-                else:
-                    region[:, :, ch] = fg_val
-
+    result = np.clip(result, 0, 255).astype(np.float32)
+    # The content-stream parser only handles vector/type3 text and Device*
+    # colors; it skips images, ICCBased/spot colors and patterns. To avoid
+    # losing that content (which would otherwise show up as a blank/black box),
+    # keep the maximum ink from the real knockout render for every pixel.
+    result = np.maximum(result, cmyk_arr.astype(np.float32))
+    if active_channels is not None:
+        for i, name in enumerate(('cyan', 'magenta', 'yellow', 'black')):
+            if not active_channels.get(name, True):
+                result[:, :, i] = 0.0
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
@@ -559,6 +715,7 @@ _OP_MAP_CACHE = {}
 
 def clear_overprint_cache():
     _OP_MAP_CACHE.clear()
+    _MASK_CACHE.clear()
 
 
 def build_overprint_position_map(doc, page):

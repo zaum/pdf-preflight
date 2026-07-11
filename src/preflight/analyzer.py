@@ -214,46 +214,74 @@ class PreflightAnalyzer:
         info['pdfx_status'] = self._check_pdfx()
         return info
 
+    def _normalize_pdfx_version(self, ver):
+        v = (ver or '').strip()
+        if not v:
+            return None
+        u = v.upper()
+        # Map known variants (with or without year suffix) to a canonical label.
+        if 'PDF/X-1A' in u:
+            return 'PDF/X-1a'
+        if 'PDF/X-1' in u:
+            return 'PDF/X-1'
+        if 'PDF/X-2' in u:
+            return 'PDF/X-2'
+        if 'PDF/X-3' in u:
+            return 'PDF/X-3'
+        if 'PDF/X-4' in u:
+            return 'PDF/X-4'
+        if 'PDF/X-5' in u:
+            return 'PDF/X-5'
+        if 'PDF/X-6' in u:
+            return 'PDF/X-6'
+        if 'PDF/X' in u:
+            return v
+        return v
+
     def _check_pdfx(self):
         if not self.doc:
             return ('n/a', False)
         try:
             xml_meta = self.doc.get_xml_metadata()
             if xml_meta:
-                import re
-                m_pdfx = re.search(r'<pdfx:PDFXVersion[^>]*>(.*?)</pdfx:PDFXVersion>', xml_meta, re.IGNORECASE)
+                # Match the version element regardless of its XML namespace
+                # prefix (e.g. pdfx:PDFXVersion, pdfxid:GTS_PDFXVersion,
+                # pdfx:PDFXConformance).
+                m_pdfx = re.search(
+                    r'<[\w-]*:?(?:PDFXVersion|GTS_PDFXVersion|PDFXConformance)\b[^>]*>(.*?)</[^>]+>',
+                    xml_meta, re.IGNORECASE)
                 if m_pdfx:
-                    ver = m_pdfx.group(1).strip()
-                    return (ver, True)
+                    ver = self._normalize_pdfx_version(m_pdfx.group(1))
+                    if ver:
+                        return (ver, True)
 
             for xri in range(1, self.doc.xref_length()):
                 try:
                     obj = self.doc.xref_object(xri)
                     if '/OutputIntent' in obj:
-                        import re
-                        obj_flat = re.sub(r'\s+', '', obj)
-                        if '/S/GTS_PDFX1A' in obj_flat:
-                            return ("PDF/X-1a:2001", True)
-                        if '/S/GTS_PDFX4' in obj_flat:
-                            return ("PDF/X-4:2010", True)
-                        if '/S/GTS_PDFX3' in obj_flat:
-                            return ("PDF/X-3:2003", True)
-                        m_s = re.search(r'/S/(GTS_PDFX[^\s/]+)', obj)
+                        m_s = re.search(r'/S\s*/(GTS_PDFX\w*)', obj)
                         if m_s:
+                            subtype = m_s.group(1).upper()
+                            if subtype == 'GTS_PDFX1A':
+                                return ('PDF/X-1a', True)
+                            if subtype == 'GTS_PDFX3':
+                                return ('PDF/X-3', True)
+                            if subtype == 'GTS_PDFX4':
+                                return ('PDF/X-4', True)
+                            if subtype == 'GTS_PDFX':
+                                return ('PDF/X', True)
                             return (f"PDF/X ({m_s.group(1)})", True)
                 except Exception:
                     continue
 
             cat_xref = self.doc.pdf_catalog()
             cat_obj = self.doc.xref_object(cat_xref) if cat_xref else ''
-            has_oi = '/OutputIntents' in cat_obj
-
-            if has_oi:
-                return ('PDF/X (unknown variant)', True)
+            if '/OutputIntents' in cat_obj:
+                return ('PDF/X', True)
 
             return ('Not PDF/X', False)
         except Exception:
-            return ('error', False)
+            return ('Not PDF/X', False)
 
     def get_security_info(self):
         sec = []

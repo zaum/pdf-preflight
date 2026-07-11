@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
     QFormLayout, QComboBox, QToolButton,
     QAbstractScrollArea, QMenu, QRadioButton,
-    QKeySequenceEdit, QSlider
+    QKeySequenceEdit, QSlider, QStyle
 )
 from PyQt6.QtCore import Qt, QSize, QSettings, pyqtSignal, QObject, QPointF, QUrl, QTimer, QRectF
 from PyQt6.QtWidgets import QSizePolicy
@@ -132,7 +132,9 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(520)
-        self.setMinimumHeight(480)
+        screen = QApplication.primaryScreen()
+        avail_h = screen.availableGeometry().height() if screen else 800
+        self.setMinimumHeight(max(520, int(avail_h * 0.5)))
         self._settings = QSettings("PDFPreflight", "Viewer")
         self._density_timer = QTimer(self)
         self._density_timer.setSingleShot(True)
@@ -248,6 +250,17 @@ class SettingsDialog(QDialog):
         magnifier_row.addWidget(self.magnifier_cb)
         magnifier_row.addStretch()
         form.addRow(magnifier_row)
+
+        # Reopen last document on startup
+        self.reopen_cb = QCheckBox("Reopen last document on startup")
+        self.reopen_cb.setChecked(
+            str(self._settings.value("ui/reopen_last", "false")).lower() == "true")
+        self.reopen_cb.toggled.connect(
+            lambda c: self._settings.setValue("ui/reopen_last", str(bool(c))))
+        reopen_row = QHBoxLayout()
+        reopen_row.addWidget(self.reopen_cb)
+        reopen_row.addStretch()
+        form.addRow(reopen_row)
         form.addRow(sep())
 
         # Box unit: radio buttons
@@ -361,8 +374,17 @@ class SettingsDialog(QDialog):
         self._mouse_pan.setStyleSheet("padding: 2px 0;")
         form.addRow("", self._mouse_pan)
 
-        layout.addLayout(form)
-        layout.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { width: 10px; }")
+        form_widget = QWidget()
+        form_widget.setLayout(form)
+        scroll.setWidget(form_widget)
+        layout.addWidget(scroll)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -467,6 +489,33 @@ class _PageProxy:
                 if b2 is not None:
                     setattr(self, f'{name}box', b2)
 
+
+# Boxes for which the spread "crop preview" applies: when one of these masks
+# is active, each page is rendered clipped to that box and the two boxes are
+# butted edge-to-edge (no gutter). Media/Art boxes keep the normal spread.
+CROP_PREVIEW_BOXES = ('trim', 'bleed', 'crop')
+
+
+def _shift_boxes_to_clip(boxes, clip):
+    """Shift box rects so they are relative to a clipped render's origin.
+
+    When a page is rendered clipped to ``clip``, the resulting image's pixel
+    (0,0) corresponds to ``clip``'s top-left, not the page origin. The overlay
+    draws boxes in page coordinates, so without this shift it misaligns and
+    paints a spurious masked strip at the gutter. Returns a new dict; the
+    input is left untouched."""
+    if clip is None:
+        return boxes
+    import fitz
+    out = {}
+    for k, b in boxes.items():
+        if b is None:
+            out[k] = b
+        else:
+            out[k] = fitz.Rect(b.x0 - clip.x0, b.y0 - clip.y0,
+                               b.x1 - clip.x0, b.y1 - clip.x0)
+    return out
+
 # Module-level fitz document cache — avoids reopening the PDF on every render
 _render_fitz_doc = None
 _render_fitz_path = None
@@ -556,16 +605,22 @@ def render_one_data(doc, page_num, zoom, mode, channels, icc_path,
         has_op = False
         display_cmyk = cmyk_arr
         if mode == "overprint":
-            from preview.overprint import OverprintPreview
+            from preview.overprint import (
+                OverprintPreview, simulate_overprint_on_cmyk)
             op = OverprintPreview()
-            _, has_op = op.simulate(cmyk_arr, pg)
+            has_op = op.detect_overprint(pg)
+            if has_op and simulate_overprint:
+                # MuPDF's get_pixmap ignores overprint, so we must simulate it
+                # ourselves by reconstructing the page in content-stream order.
+                display_cmyk = simulate_overprint_on_cmyk(cmyk_arr, pg, doc)
         elif mode == "separation":
             from preview.separation import SeparationPreview
             sp = SeparationPreview()
             display_cmyk = sp.composite(cmyk_arr, channels)
             if simulate_overprint:
                 from preview.overprint import simulate_overprint_on_cmyk
-                display_cmyk = simulate_overprint_on_cmyk(display_cmyk, pg, doc)
+                display_cmyk = simulate_overprint_on_cmyk(
+                    display_cmyk, pg, doc, active_channels=channels)
         # Fast RGB draft: use MuPDF csRGB on raw pixmap, or PIL convert
         if display_cmyk is cmyk_arr and mode != "overprint":
             pix_rgb = fitz.Pixmap(fitz.csRGB, pix_cmyk)
@@ -661,6 +716,19 @@ class FitzThumbWorker(QObject):
             self._doc_path = path
         return self._doc
 
+    @staticmethod
+    def _crop_box_rect(doc, page_num, name):
+        """Return a valid fitz.Rect for the named box of a page, or None."""
+        import fitz
+        try:
+            pg = doc[page_num]
+            b = getattr(pg, f'{name}box', None)
+            if b is not None and b.x0 < b.x1 and b.y0 < b.y1:
+                return fitz.Rect(b)
+        except Exception:
+            pass
+        return None
+
     def _run(self):
         import fitz
         from viewer.render_engine import get_cmyk_icc_path
@@ -735,25 +803,37 @@ class FitzThumbWorker(QObject):
         import time
 
         (_, path, page_num, zoom, mode, channels, icc_path, sim_profile,
-         spread, is_offset_single, simulate_overprint, cancel_event,
-         seq, draft_seq, cache_key) = item
+          spread, is_offset_single, simulate_overprint, box_mask,
+          cancel_event, seq, draft_seq, cache_key) = item
 
         doc = self._get_doc(path)
 
-        def _r1(pn):
+        crop_box = box_mask if box_mask in CROP_PREVIEW_BOXES else None
+
+        def _r1(pn, clip=None):
             return render_one_data(doc, pn, zoom, mode, channels, icc_path,
-                                    sim_profile, simulate_overprint)
+                                    sim_profile, simulate_overprint, clip=clip)
         try:
-            rgb_arr, fast_rgb_arr, cmyk_arr, boxes, page_rect, has_op = _r1(page_num)
+            clip1 = (self._crop_box_rect(doc, page_num, crop_box)
+                     if crop_box else None)
+            rgb_arr, fast_rgb_arr, cmyk_arr, boxes, page_rect, has_op = _r1(page_num, clip=clip1)
+            if clip1 is not None:
+                page_rect = clip1
+                boxes = _shift_boxes_to_clip(boxes, clip1)
             if cancel_event.is_set() or self._cancel.is_set():
                 return
 
             self.page_draft_ready.emit(fast_rgb_arr, boxes, zoom, page_rect, draft_seq)
 
             if spread:
-                GAP_PX = 20
+                GAP_PX = 0 if crop_box else 20
                 BG_RGB = np.array([64, 64, 64], dtype=np.uint8)
-                rgb_arr2, fast_rgb_arr2, cmyk_arr2, boxes2, rect2, has_op2 = _r1(page_num + 1)
+                clip2 = (self._crop_box_rect(doc, page_num + 1, crop_box)
+                         if crop_box else None)
+                rgb_arr2, fast_rgb_arr2, cmyk_arr2, boxes2, rect2, has_op2 = _r1(page_num + 1, clip=clip2)
+                if clip2 is not None:
+                    rect2 = clip2
+                    boxes2 = _shift_boxes_to_clip(boxes2, clip2)
                 if cancel_event.is_set() or self._cancel.is_set():
                     return
                 h1, w1 = rgb_arr.shape[:2]
@@ -830,22 +910,35 @@ class FitzThumbWorker(QObject):
         import numpy as np
 
         (_, path, page_num, zoom, mode, channels, icc_path, sim_profile,
-         spread, is_offset_single, simulate_overprint, cache_key) = item
+          spread, is_offset_single, simulate_overprint, box_mask,
+          cache_key) = item
 
         doc = self._get_doc(path)
 
-        def _r1(pn):
+        crop_box = box_mask if box_mask in CROP_PREVIEW_BOXES else None
+
+        def _r1(pn, clip=None):
             return render_one_data(doc, pn, zoom, mode, channels, icc_path,
-                                    sim_profile, simulate_overprint)
+                                    sim_profile, simulate_overprint, clip=clip)
         try:
-            rgb_arr, fast_rgb_arr, cmyk_arr, boxes, page_rect, has_op = _r1(page_num)
+            clip1 = (self._crop_box_rect(doc, page_num, crop_box)
+                     if crop_box else None)
+            rgb_arr, fast_rgb_arr, cmyk_arr, boxes, page_rect, has_op = _r1(page_num, clip=clip1)
+            if clip1 is not None:
+                page_rect = clip1
+                boxes = _shift_boxes_to_clip(boxes, clip1)
             if self._cancel.is_set():
                 return
 
             if spread:
-                GAP_PX = 20
+                GAP_PX = 0 if crop_box else 20
                 BG_RGB = np.array([64, 64, 64], dtype=np.uint8)
-                _, _, cmyk_arr2, boxes2, rect2, _ = _r1(page_num + 1)
+                clip2 = (self._crop_box_rect(doc, page_num + 1, crop_box)
+                         if crop_box else None)
+                _, _, cmyk_arr2, boxes2, rect2, _ = _r1(page_num + 1, clip=clip2)
+                if clip2 is not None:
+                    rect2 = clip2
+                    boxes2 = _shift_boxes_to_clip(boxes2, clip2)
                 if self._cancel.is_set():
                     return
                 h1, w1 = cmyk_arr.shape[:2]
@@ -937,21 +1030,23 @@ class FitzThumbWorker(QObject):
         self._queue.put(('tac', path, page_index, zoom))
 
     def submit_page(self, path, page_num, zoom, mode, channels,
-                    icc_path, sim_profile, spread, is_offset_single,
-                    simulate_overprint, cancel_event, seq, draft_seq, cache_key):
+                     icc_path, sim_profile, spread, is_offset_single,
+                     simulate_overprint, box_mask, cancel_event, seq,
+                     draft_seq, cache_key):
         self._queue.put(('page', path, page_num, zoom, mode, channels,
                          icc_path, sim_profile, spread, is_offset_single,
-                         simulate_overprint, cancel_event, seq, draft_seq, cache_key))
+                         simulate_overprint, box_mask, cancel_event, seq,
+                         draft_seq, cache_key))
 
     def submit_mag(self, path, page_num, cancel_event):
         self._queue.put(('mag', path, page_num, cancel_event))
 
     def submit_prefetch(self, path, page_num, zoom, mode, channels,
-                        icc_path, sim_profile, spread, is_offset_single,
-                        simulate_overprint, cache_key):
-        self._queue.put(('prefetch', path, page_num, zoom, mode, channels,
                          icc_path, sim_profile, spread, is_offset_single,
-                         simulate_overprint, cache_key))
+                         simulate_overprint, box_mask, cache_key):
+        self._queue.put(('prefetch', path, page_num, zoom, mode, channels,
+                          icc_path, sim_profile, spread, is_offset_single,
+                          simulate_overprint, box_mask, cache_key))
 
     def clear_pending(self):
         while not self._queue.empty():
@@ -1059,12 +1154,21 @@ class PreflightWindow(QMainWindow):
         theme = f"{mode}_teal.xml"
         self._apply_theme(theme)
         self._restore_collapse_states()
+        self._maybe_reopen_last()
 
     def _load_recent(self):
         raw = self._settings.value("recent/files", [])
         if isinstance(raw, str):
             raw = [raw]
         return list(raw)[:20] if raw else []
+
+    def _maybe_reopen_last(self):
+        if str(self._settings.value("ui/reopen_last", "false")).lower() != "true":
+            return
+        for path in self._recent_files:
+            if os.path.isfile(path):
+                self.open_file(path)
+                return
 
     def _save_recent(self):
         self._settings.setValue("recent/files", self._recent_files[:20])
@@ -1308,6 +1412,7 @@ class PreflightWindow(QMainWindow):
             spread,
             is_offset_single,
             self.chk_simulate_overprint.isChecked(),
+            self._active_box_mask,
         )
 
     def _cache_get(self, key):
@@ -1386,26 +1491,34 @@ class PreflightWindow(QMainWindow):
         self._thumb_worker.submit_page(
             path, render_page, zoom, mode, channels,
             icc_path, sim_profile, spread, is_offset_single,
-            simulate_op, cancel_event, seq, draft_seq, cache_key)
+            simulate_op, self._active_box_mask, cancel_event, seq,
+            draft_seq, cache_key)
 
     @staticmethod
     def _render_bg(path, page_num, zoom, mode, channels,
                    icc_path, sim_profile, spread, is_offset_single,
-                   simulate_overprint,
-                   cancel_event, signals, seq=0, use_cached_doc=True, draft_seq=0):
+                   simulate_overprint, box_mask=None,
+                   cancel_event=None, signals=None, seq=0, use_cached_doc=True,
+                   draft_seq=0):
         import fitz
         import numpy as np
         from PIL import Image
         import os
 
-        def _render_one(pn, doc):
+        def _render_one(pn, doc, clip=None):
             return render_one_data(doc, pn, zoom, mode, channels, icc_path,
-                                   sim_profile, simulate_overprint)
+                                    sim_profile, simulate_overprint, clip=clip)
 
         doc = None
         try:
             doc = _get_render_doc(path) if use_cached_doc else fitz.open(path)
-            rgb_arr, fast_rgb_arr, cmyk_arr, boxes, page_rect, has_op = _render_one(page_num, doc)
+            crop_box = box_mask if box_mask in CROP_PREVIEW_BOXES else None
+            clip1 = (FitzThumbWorker._crop_box_rect(doc, page_num, crop_box)
+                     if crop_box else None)
+            rgb_arr, fast_rgb_arr, cmyk_arr, boxes, page_rect, has_op = _render_one(page_num, doc, clip=clip1)
+            if clip1 is not None:
+                page_rect = clip1
+                boxes = _shift_boxes_to_clip(boxes, clip1)
             if cancel_event.is_set():
                 return
 
@@ -1413,9 +1526,14 @@ class PreflightWindow(QMainWindow):
             signals.draft.emit(fast_rgb_arr, boxes, zoom, page_rect, draft_seq)
 
             if spread:
-                GAP_PX = 20
+                GAP_PX = 0 if crop_box else 20
                 BG_RGB = np.array([64, 64, 64], dtype=np.uint8)
-                rgb_arr2, fast_rgb_arr2, cmyk_arr2, boxes2, rect2, has_op2 = _render_one(page_num + 1, doc)
+                clip2 = (FitzThumbWorker._crop_box_rect(doc, page_num + 1, crop_box)
+                         if crop_box else None)
+                rgb_arr2, fast_rgb_arr2, cmyk_arr2, boxes2, rect2, has_op2 = _render_one(page_num + 1, doc, clip=clip2)
+                if clip2 is not None:
+                    rect2 = clip2
+                    boxes2 = _shift_boxes_to_clip(boxes2, clip2)
                 if cancel_event.is_set():
                     return
                 # Stitch fast RGB for draft signal
@@ -1499,8 +1617,8 @@ class PreflightWindow(QMainWindow):
 
     @staticmethod
     def _render_to_entry(path, page_num, zoom, mode, channels,
-                         icc_path, sim_profile, spread, is_offset_single,
-                         simulate_overprint):
+                          icc_path, sim_profile, spread, is_offset_single,
+                          simulate_overprint, box_mask=None):
         result = {}
 
         class _Done:
@@ -1538,8 +1656,8 @@ class PreflightWindow(QMainWindow):
         cancel_event = threading.Event()
         PreflightWindow._render_bg(
             path, page_num, zoom, mode, channels, icc_path, sim_profile,
-            spread, is_offset_single, simulate_overprint, cancel_event,
-            _Signals(), 0, use_cached_doc=False)
+            spread, is_offset_single, simulate_overprint, box_mask,
+            cancel_event, _Signals(), 0, use_cached_doc=False)
         return result.get('entry')
 
     def _on_page_done_ready(self, rgb_arr, boxes, zoom, has_op, cmyk_buf,
@@ -1632,7 +1750,8 @@ class PreflightWindow(QMainWindow):
         simulate_op = self.chk_simulate_overprint.isChecked()
         self._thumb_worker.submit_prefetch(
             path, render_page, zoom, mode, channels, icc_path, sim_profile,
-            spread, is_offset_single, simulate_op, cache_key)
+            spread, is_offset_single, simulate_op, self._active_box_mask,
+            cache_key)
 
     def _start_magnifier_cache_build(self):
         """Build magnifier cache on the worker thread so it's ready on right-click."""
@@ -1684,6 +1803,7 @@ class PreflightWindow(QMainWindow):
         if btn:
             btn.setIcon(self._icon('crop_on' if active else 'crop'))
         self.page_widget.viewport().update()
+        self._start_bg_render()
 
     def _icon(self, name, color=None):
         path = os.path.join(os.path.dirname(__file__), '..', '..',
@@ -1709,6 +1829,14 @@ class PreflightWindow(QMainWindow):
         w = QWidget()
         w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         return w
+
+    def _update_page_spin_width(self, max_value):
+        digits = max(1, len(str(max(1, max_value))))
+        fm = self.spin_page.fontMetrics()
+        text_w = fm.horizontalAdvance("9" * digits)
+        frame_w = self.style().pixelMetric(
+            QStyle.PixelMetric.PM_SpinBoxFrameWidth)
+        self.spin_page.setFixedWidth(text_w + 2 * frame_w + 8)
 
     def _build_ui(self):
         self.page_widget = PageWidget()
@@ -1794,9 +1922,9 @@ class PreflightWindow(QMainWindow):
         self.spin_page = QSpinBox()
         self.spin_page.setMinimum(1)
         self.spin_page.setMaximum(1)
-        self.spin_page.setFixedWidth(60)
         self.spin_page.setButtonSymbols(
             QSpinBox.ButtonSymbols.NoButtons)
+        self._update_page_spin_width(1)
         tb.addWidget(self.spin_page)
         self.lbl_page_total = QLabel("/ 1")
         tb.addWidget(self.lbl_page_total)
@@ -1902,7 +2030,8 @@ class PreflightWindow(QMainWindow):
         self.cs_grid.setStyleSheet("background: transparent;")
         self.cs_grid_layout = QGridLayout(self.cs_grid)
         self.cs_grid_layout.setContentsMargins(0, 0, 0, 0)
-        self.cs_grid_layout.setSpacing(5)
+        self.cs_grid_layout.setHorizontalSpacing(14)
+        self.cs_grid_layout.setVerticalSpacing(5)
         csv.addWidget(self.cs_grid)
         blk.set_content(csw)
         self._collapse_blocks['colorspace'] = blk
@@ -1999,7 +2128,9 @@ class PreflightWindow(QMainWindow):
                 f"QPushButton {{ border: 1px solid {self._muted_color}; border-left: 3px solid {color}; "
                 f"text-align: center; padding: 4px 8px; color: {self._muted_color}; font-weight: normal; font-size: 9pt; }}"
                 f"QPushButton:hover {{ border-left: 4px solid {color}; background: rgba(128,128,128,0.15); }}"
-                f"QPushButton:checked {{ border-left: 4px solid {color}; }}")
+                f"QPushButton:checked {{ border-left: 4px solid {color}; }}"
+                f"QPushButton:disabled {{ border: 1px solid {self._muted_color}; border-left: 3px solid {self._muted_color}; "
+                f"color: {self._muted_color}; background: transparent; }}")
             btn.setFixedHeight(28)
             sep_hl.addWidget(btn, 1)  # stretch factor 1 — fill space equally
         sv.addLayout(sep_hl)
@@ -2064,10 +2195,18 @@ class PreflightWindow(QMainWindow):
         fv.setContentsMargins(4, 4, 4, 4)
         fv.setSpacing(2)
         self.font_list = QListWidget()
-        self.font_list.setMaximumHeight(300)
+        self.font_list.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.font_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.font_list.setStyleSheet(
             "QListWidget::item { padding: 0px 4px; font-size: 7pt; margin: 0px; }"
-            "QListWidget { outline: none; }")
+            "QListWidget { outline: none; }"
+            "QScrollBar:vertical { width: 8px; background: transparent; }"
+            "QScrollBar::handle:vertical { background: rgba(128,128,128,0.5);"
+            " border-radius: 4px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            " { height: 0px; }")
         fv.addWidget(self.font_list)
         hl = QHBoxLayout()
         hl.setSpacing(4)
@@ -2507,12 +2646,13 @@ class PreflightWindow(QMainWindow):
         name_label = QLabel(clean_name)
         name_label.setStyleSheet("background: transparent;")
         layout.addWidget(name_label)
+        layout.addStretch()
         if is_subset:
             subset_label = QLabel("subset")
             subset_label.setStyleSheet(
                 "font-size: 7pt; background: transparent;")
             layout.addWidget(subset_label)
-        layout.addStretch()
+        item.setSizeHint(QSize(0, 22))
         self.font_list.addItem(item)
         self.font_list.setItemWidget(item, widget)
 
@@ -2543,27 +2683,30 @@ class PreflightWindow(QMainWindow):
             if box and box.x0 < box.x1 and box.y0 < box.y1:
                 fmt = self._format_box(box)
 
-                eye_btn = QPushButton()
-                eye_btn.setCheckable(True)
-                eye_btn.setFixedWidth(24)
-                eye_btn.setFixedHeight(24)
-                eye_btn.setIcon(self._icon('crop'))
-                eye_btn.setIconSize(QSize(18, 18))
-                eye_btn.setStyleSheet(
-                    f"QPushButton {{ border: none; border-radius: 3px; padding: 0px; }}"
-                    f"QPushButton:hover {{ background: rgba(128,128,128,0.2); }}"
-                    f"QPushButton:checked {{ border: none; background: transparent; }}")
-                eye_btn._hover_connected = True
-                eye_btn.enterEvent = lambda e, b=eye_btn: b.setIcon(self._icon('crop', color=self._accent_color))
-                eye_btn.leaveEvent = lambda e, b=eye_btn: b.setIcon(
-                    self._icon('crop', color=self._accent_color if b.isChecked() else None))
-                eye_btn.toggled.connect(
-                    lambda checked, n=name, btn=eye_btn: (
-                        self._set_box_mask(n, checked),
-                        btn.setIcon(self._icon('crop', color=self._accent_color if checked else None))
-                    )[-1])
-                self._box_eye_btns[name] = eye_btn
-                self.boxes_grid_layout.addWidget(eye_btn, row, 0)
+                has_eye = name in CROP_PREVIEW_BOXES
+                if has_eye:
+                    eye_btn = QPushButton()
+                    eye_btn.setCheckable(True)
+                    eye_btn.setFixedWidth(24)
+                    eye_btn.setFixedHeight(24)
+                    eye_btn.setIcon(self._icon('crop'))
+                    eye_btn.setIconSize(QSize(18, 18))
+                    eye_btn.setToolTip(f"Crop to {name} box")
+                    eye_btn.setStyleSheet(
+                        f"QPushButton {{ border: none; border-radius: 3px; padding: 0px; }}"
+                        f"QPushButton:hover {{ background: rgba(128,128,128,0.2); }}"
+                        f"QPushButton:checked {{ border: none; background: transparent; }}")
+                    eye_btn._hover_connected = True
+                    eye_btn.enterEvent = lambda e, b=eye_btn: b.setIcon(self._icon('crop', color=self._accent_color))
+                    eye_btn.leaveEvent = lambda e, b=eye_btn: b.setIcon(
+                        self._icon('crop', color=self._accent_color if b.isChecked() else None))
+                    eye_btn.toggled.connect(
+                        lambda checked, n=name, btn=eye_btn: (
+                            self._set_box_mask(n, checked),
+                            btn.setIcon(self._icon('crop', color=self._accent_color if checked else None))
+                        )[-1])
+                    self._box_eye_btns[name] = eye_btn
+                    self.boxes_grid_layout.addWidget(eye_btn, row, 0)
 
                 toggle_btn = QPushButton(f"{name.title()} box" if name != 'media' else "Media box")
                 toggle_btn.setCheckable(True)
@@ -2620,7 +2763,11 @@ class PreflightWindow(QMainWindow):
         for f in fonts:
             self._add_font_item(f)
         if not fonts:
-            self.font_list.addItem("(no fonts)")
+            no_item = QListWidgetItem("(no fonts)")
+            no_item.setSizeHint(QSize(0, 22))
+            self.font_list.addItem(no_item)
+        visible = min(self.font_list.count(), 4) if self.font_list.count() else 1
+        self.font_list.setFixedHeight(visible * 22 + 2)
 
         # Color spaces
         try:
@@ -2672,17 +2819,11 @@ class PreflightWindow(QMainWindow):
                     self._add_row(self.cs_grid_layout, row, "Output Color Intent", val)
                     row += 1
             level, ok = ci.get('pdfx_status', ('n/a', False))
-            matched_variants = []
-            for v in ["PDF/X-1a:2001", "PDF/X-1a:2003", "PDF/X-2:2003",
-                       "PDF/X-3:2002", "PDF/X-3:2003", "PDF/X-4:2008", "PDF/X-4:2010",
-                       "PDF/X-5:2010", "PDF/X-5g", "PDF/X-5n", "PDF/X-5pg",
-                       "PDF/X-6:2020", "PDF/X-6p"]:
-                if v in level:
-                    matched_variants.append(v)
-            if matched_variants:
-                self._add_row(self.cs_grid_layout, row, "PDF/X", " ✓ ".join(matched_variants), "#4caf50")
+            if ok and level not in ('n/a', None, ''):
+                self._add_row(self.cs_grid_layout, row, "PDF/X", level, "#4caf50")
             else:
-                self._add_row(self.cs_grid_layout, row, "PDF/X", f"Not PDF/X ({level})" if level != 'n/a' else "Not PDF/X", "#f44336")
+                extra = f" ({level})" if level and level not in ('n/a', 'Not PDF/X') else ""
+                self._add_row(self.cs_grid_layout, row, "PDF/X", "Not PDF/X" + extra, "#f44336")
         except Exception:
             self._clear_grid(self.cs_grid_layout)
             self._add_row(self.cs_grid_layout, 0, "Color Space", "—")
@@ -2892,7 +3033,24 @@ class PreflightWindow(QMainWindow):
 
     def _display_render_result(self, rgb_arr, cmyk_buf, boxes, zoom, has_op, page_rect, pg2_info=None):
         old_pdf_center = None
+        # When the render scale (and thus the pixmap size) is unchanged, the
+        # view must stay pixel-identical -- so capture the exact scroll position
+        # and restore it. Re-deriving the center from the (integer) viewport
+        # center and re-applying centerOn drifts by ~1px per render because the
+        # view is scaled, so 1 widget pixel maps to several scene pixels and the
+        # rounding error accumulates every re-render (visible as a slow shift
+        # when toggling separation / overprint buttons).
+        preserve_scroll = False
+        saved_sx = saved_sy = 0
         if (self._last_render_zoom > 0
+                and self.page_widget.pixmap_item is not None
+                and abs(zoom - self._last_render_zoom) < 0.001):
+            sb = self.page_widget.horizontalScrollBar()
+            vb = self.page_widget.verticalScrollBar()
+            saved_sx = sb.value()
+            saved_sy = vb.value()
+            preserve_scroll = True
+        elif (self._last_render_zoom > 0
                 and self.page_widget.pixmap_item is not None):
             vp = self.page_widget.viewport().rect()
             if vp.width() > 0 and vp.height() > 0:
@@ -2921,6 +3079,9 @@ class PreflightWindow(QMainWindow):
         if self._center_on_page:
             self._center_on_page = False
             self.page_widget.centerOn(w / 2, h / 2)
+        elif preserve_scroll:
+            self.page_widget.horizontalScrollBar().setValue(saved_sx)
+            self.page_widget.verticalScrollBar().setValue(saved_sy)
         elif old_pdf_center is not None:
             self.page_widget.centerOn(
                 QPointF(old_pdf_center.x() * zoom,
@@ -2993,6 +3154,11 @@ class PreflightWindow(QMainWindow):
         cy0 = max(0.0, cy0 - my)
         cx1 = min(pw, cx1 + mx)
         cy1 = min(ph, cy1 + my)
+        # Snap the tile origin to the base-render pixel grid so the sharp tile
+        # aligns exactly with the underlying pixmap (avoids a sub-pixel drift
+        # that, combined with the tile scale, reads as a 1px shift).
+        cx0 = round(cx0 * base_zoom) / base_zoom
+        cy0 = round(cy0 * base_zoom) / base_zoom
         if cx1 - cx0 < 1.0 or cy1 - cy0 < 1.0:
             self.page_widget.clear_detail_overlay()
             return
@@ -3023,10 +3189,15 @@ class PreflightWindow(QMainWindow):
         qimg = QImage(rgb_arr.data, w, h, w * 3,
                       QImage.Format.Format_RGB888).copy()
         base_zoom = self._last_render_zoom
-        cx0, cy0, _, _ = clip
-        item_scale = base_zoom / detail_zoom
+        cx0, cy0, cx1, cy1 = clip
+        # Use the tile's ACTUAL pixel size so the scale matches the clip
+        # exactly (a 1px rounding difference in the clip render would
+        # otherwise scale the whole tile slightly wrong and shift it).
+        item_scale_x = (cx1 - cx0) * base_zoom / w if w else 1.0
+        item_scale_y = (cy1 - cy0) * base_zoom / h if h else 1.0
         self.page_widget.set_detail_overlay(
-            qimg, cx0 * base_zoom, cy0 * base_zoom, item_scale)
+            qimg, cx0 * base_zoom, cy0 * base_zoom,
+            item_scale_x, item_scale_y)
 
     def _warm_caches(self):
         """Pre-warm content stream and overprint caches in background."""
@@ -3058,6 +3229,7 @@ class PreflightWindow(QMainWindow):
             self.act_save.setVisible(True)
             self.act_close.setVisible(True)
             self.spin_page.setMaximum(count)
+            self._update_page_spin_width(count)
             self.lbl_page_total.setText(f"/ {count}")
             multi = count > 1
             self.act_first.setEnabled(multi)
@@ -3222,6 +3394,39 @@ class PreflightWindow(QMainWindow):
         self._cache_clear()
         self._start_bg_render()
 
+    def _fit_spread(self):
+        if not self.render.doc or self._overview_active:
+            return
+        if self._spread_mode() is None:
+            return
+        render_page, spread, is_offset_single = self._render_plan(self._current_page)
+        doc = self.render.doc
+        r1 = doc[render_page].rect
+        if is_offset_single:
+            total_w = r1.width * 2
+            total_h = r1.height
+        elif spread and render_page + 1 < self.render.page_count:
+            r2 = doc[render_page + 1].rect
+            total_w = r1.width + r2.width
+            total_h = max(r1.height, r2.height)
+        else:
+            total_w = r1.width
+            total_h = r1.height
+        if total_w <= 0 or total_h <= 0:
+            return
+        w = self.page_widget.width()
+        h = self.page_widget.height()
+        # The spread gutter is rendered as a fixed 20px pixel gap; reserve
+        # it so the whole pair stays visible.
+        self._is_fit_viewport = True
+        self._zoom = max(0.1, min(20.0,
+                         min((w - 4 - 20) / total_w, (h - 4) / total_h) * 0.95))
+        self.lbl_zoom.setText(f"{self._zoom*100:.0f}%")
+        self._center_on_page = True
+        self._cancel_active_render()
+        self._apply_live_zoom_transform()
+        self._start_bg_render(debounce_ms=0)
+
     def _set_view_spread(self):
         self.act_single.setChecked(False)
         self.act_spread.setChecked(True)
@@ -3230,7 +3435,7 @@ class PreflightWindow(QMainWindow):
             self._rebuild_overview_if_active()
             return
         self._cache_clear()
-        self._start_bg_render()
+        self._fit_spread()
 
     def _set_view_spread_offset(self):
         self.act_single.setChecked(False)
@@ -3240,7 +3445,7 @@ class PreflightWindow(QMainWindow):
             self._rebuild_overview_if_active()
             return
         self._cache_clear()
-        self._start_bg_render()
+        self._fit_spread()
 
     def _on_wheel(self, direction):
         if direction > 0:
@@ -3739,12 +3944,23 @@ class PreflightWindow(QMainWindow):
             if event.type() == event.Type.DragEnter:
                 self.dragEnterEvent(event)
                 return True
+            if event.type() == event.Type.DragMove:
+                self.dragMoveEvent(event)
+                return True
             if event.type() == event.Type.Drop:
                 self.dropEvent(event)
                 return True
         return super().eventFilter(obj, event)
 
     def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.toLocalFile().lower().endswith('.pdf'):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 if url.toLocalFile().lower().endswith('.pdf'):

@@ -139,18 +139,24 @@ class PageWidget(QGraphicsView):
         margin_h = max(r.height(), self.viewport().height()) * 2.0
         self.scene.setSceneRect(r.adjusted(-margin_w, -margin_h, margin_w, margin_h))
 
-    def set_detail_overlay(self, qimage, scene_x, scene_y, item_scale):
+    def set_detail_overlay(self, qimage, scene_x, scene_y, item_scale_x,
+                            item_scale_y):
         """Place a high-resolution detail tile on top of the base pixmap.
 
         The tile covers only the visible region but is rendered at the true
-        display zoom, so it appears vector-sharp. ``item_scale`` maps the tile's
-        native pixels back to the base-render scene units."""
+        display zoom, so it appears vector-sharp. ``item_scale_x``/``item_scale_y``
+        map the tile's native pixels back to the base-render scene units. They
+        are derived from the tile's ACTUAL pixel dimensions (not from the
+        nominal zoom ratio), otherwise a 1px rounding difference in the clip
+        render would scale the whole tile slightly wrong and shift its content
+        by up to a pixel relative to the base."""
         if self.pixmap_item is None or self.pixmap_item.scene() is None:
             return
         self.clear_detail_overlay()
         item = QGraphicsPixmapItem(QPixmap.fromImage(qimage))
         item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-        item.setScale(item_scale)
+        from PyQt6.QtGui import QTransform
+        item.setTransform(QTransform.fromScale(item_scale_x, item_scale_y))
         item.setPos(scene_x, scene_y)
         item.setZValue(1.0)
         self.scene.addItem(item)
