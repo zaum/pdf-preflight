@@ -101,8 +101,10 @@ class CollapsibleBlock(QWidget):
             self._content_area.layout().removeWidget(self._content_widget)
             self._content_widget.deleteLater()
         self._content_widget = widget
-        cl = QVBoxLayout(self._content_area)
-        cl.setContentsMargins(16, 2, 2, 2)
+        cl = self._content_area.layout()
+        if cl is None:
+            cl = QVBoxLayout(self._content_area)
+            cl.setContentsMargins(16, 2, 2, 2)
         cl.addWidget(widget)
 
     def save_state(self):
@@ -567,7 +569,8 @@ def _get_bg_icc_transform(icc_path):
         return transform
 
 def render_one_data(doc, page_num, zoom, mode, channels, icc_path,
-                    sim_profile, simulate_overprint, clip=None):
+                    sim_profile, simulate_overprint, clip=None,
+                    object_filter=None):
     """Render a single page to an RGB numpy array following the active
     mode (normal / overprint / separation), channels, ICC and simulation
     profile. Returns (rgb_arr, fast_rgb_arr, cmyk_arr, boxes, page_rect, has_op).
@@ -602,6 +605,10 @@ def render_one_data(doc, page_num, zoom, mode, channels, icc_path,
                     _restore_overprint(doc, modified)
         cmyk_arr = np.frombuffer(pix_cmyk.samples, dtype=np.uint8).reshape(
             pix_cmyk.height, pix_cmyk.width, 4)
+        if object_filter is not None:
+            from preview.object_filter import apply_object_filter
+            cmyk_arr = apply_object_filter(
+                cmyk_arr, pg, zoom, object_filter, clip=clip)
         has_op = False
         display_cmyk = cmyk_arr
         if mode == "overprint":
@@ -804,7 +811,7 @@ class FitzThumbWorker(QObject):
 
         (_, path, page_num, zoom, mode, channels, icc_path, sim_profile,
           spread, is_offset_single, simulate_overprint, box_mask,
-          cancel_event, seq, draft_seq, cache_key) = item
+          cancel_event, seq, draft_seq, cache_key, object_filter) = item
 
         doc = self._get_doc(path)
 
@@ -812,7 +819,8 @@ class FitzThumbWorker(QObject):
 
         def _r1(pn, clip=None):
             return render_one_data(doc, pn, zoom, mode, channels, icc_path,
-                                    sim_profile, simulate_overprint, clip=clip)
+                                    sim_profile, simulate_overprint, clip=clip,
+                                    object_filter=object_filter)
         try:
             clip1 = (self._crop_box_rect(doc, page_num, crop_box)
                      if crop_box else None)
@@ -911,7 +919,7 @@ class FitzThumbWorker(QObject):
 
         (_, path, page_num, zoom, mode, channels, icc_path, sim_profile,
           spread, is_offset_single, simulate_overprint, box_mask,
-          cache_key) = item
+          cache_key, object_filter) = item
 
         doc = self._get_doc(path)
 
@@ -919,7 +927,8 @@ class FitzThumbWorker(QObject):
 
         def _r1(pn, clip=None):
             return render_one_data(doc, pn, zoom, mode, channels, icc_path,
-                                    sim_profile, simulate_overprint, clip=clip)
+                                    sim_profile, simulate_overprint, clip=clip,
+                                    object_filter=object_filter)
         try:
             clip1 = (self._crop_box_rect(doc, page_num, crop_box)
                      if crop_box else None)
@@ -996,7 +1005,8 @@ class FitzThumbWorker(QObject):
         import fitz
 
         (_, path, page_num, zoom, clip, mode, channels, icc_path,
-         sim_profile, simulate_overprint, cancel_event, seq) = item
+         sim_profile, simulate_overprint, cancel_event, seq,
+         object_filter) = item
 
         if cancel_event.is_set() or self._cancel.is_set():
             return
@@ -1005,7 +1015,8 @@ class FitzThumbWorker(QObject):
             clip_rect = fitz.Rect(*clip)
             rgb_arr, _, _, _, _, _ = render_one_data(
                 doc, page_num, zoom, mode, channels, icc_path,
-                sim_profile, simulate_overprint, clip=clip_rect)
+                sim_profile, simulate_overprint, clip=clip_rect,
+                object_filter=object_filter)
             if cancel_event.is_set() or self._cancel.is_set():
                 return
             if rgb_arr is None or rgb_arr.size == 0:
@@ -1016,10 +1027,10 @@ class FitzThumbWorker(QObject):
 
     def submit_detail(self, path, page_num, zoom, clip, mode, channels,
                       icc_path, sim_profile, simulate_overprint,
-                      cancel_event, seq):
+                      cancel_event, seq, object_filter=None):
         self._queue.put(('detail', path, page_num, zoom, clip, mode, channels,
                          icc_path, sim_profile, simulate_overprint,
-                         cancel_event, seq))
+                         cancel_event, seq, object_filter))
 
     def submit_thumb(self, path, page_index, ov_scale, mode, channels,
                      sim_profile, op):
@@ -1032,21 +1043,23 @@ class FitzThumbWorker(QObject):
     def submit_page(self, path, page_num, zoom, mode, channels,
                      icc_path, sim_profile, spread, is_offset_single,
                      simulate_overprint, box_mask, cancel_event, seq,
-                     draft_seq, cache_key):
+                     draft_seq, cache_key, object_filter=None):
         self._queue.put(('page', path, page_num, zoom, mode, channels,
-                         icc_path, sim_profile, spread, is_offset_single,
-                         simulate_overprint, box_mask, cancel_event, seq,
-                         draft_seq, cache_key))
+                          icc_path, sim_profile, spread, is_offset_single,
+                          simulate_overprint, box_mask, cancel_event, seq,
+                          draft_seq, cache_key, object_filter))
 
     def submit_mag(self, path, page_num, cancel_event):
         self._queue.put(('mag', path, page_num, cancel_event))
 
     def submit_prefetch(self, path, page_num, zoom, mode, channels,
                          icc_path, sim_profile, spread, is_offset_single,
-                         simulate_overprint, box_mask, cache_key):
+                         simulate_overprint, box_mask, cache_key,
+                         object_filter=None):
         self._queue.put(('prefetch', path, page_num, zoom, mode, channels,
                           icc_path, sim_profile, spread, is_offset_single,
-                          simulate_overprint, box_mask, cache_key))
+                          simulate_overprint, box_mask, cache_key,
+                          object_filter))
 
     def clear_pending(self):
         while not self._queue.empty():
@@ -1123,6 +1136,7 @@ class PreflightWindow(QMainWindow):
         self._render_cancel = threading.Event()
         self._render_signals = _RenderSignals()
         self._draft_seq = 0
+        self._of_batch_update = False
 
         # ---- Overview (zoom-driven, continuous) state ----
         self._overview_active = False
@@ -1233,6 +1247,8 @@ class PreflightWindow(QMainWindow):
         clear_cache()
         from preview.overprint import clear_overprint_cache
         clear_overprint_cache()
+        from preview.object_filter import clear_cache as of_clear_cache
+        of_clear_cache()
         self.analyzer.close()
         self.render.close()
         _close_render_doc_cache()
@@ -1300,6 +1316,7 @@ class PreflightWindow(QMainWindow):
             self.page_widget._apply_theme_colors(is_light)
         self._update_sidebar_colors(is_light)
         self._update_accent_styles()
+        self._update_of_styles()
 
     def _reload_icons(self):
         for act in [self.act_save, self.act_close, self.act_first,
@@ -1413,6 +1430,7 @@ class PreflightWindow(QMainWindow):
             is_offset_single,
             self.chk_simulate_overprint.isChecked(),
             self._active_box_mask,
+            self._object_filter_key(),
         )
 
     def _cache_get(self, key):
@@ -1488,18 +1506,19 @@ class PreflightWindow(QMainWindow):
         cancel_event = threading.Event()
         self._render_cancel = cancel_event
         simulate_op = self.chk_simulate_overprint.isChecked()
+        object_filter = self._object_filter_state()
         self._thumb_worker.submit_page(
             path, render_page, zoom, mode, channels,
             icc_path, sim_profile, spread, is_offset_single,
             simulate_op, self._active_box_mask, cancel_event, seq,
-            draft_seq, cache_key)
+            draft_seq, cache_key, object_filter)
 
     @staticmethod
     def _render_bg(path, page_num, zoom, mode, channels,
                    icc_path, sim_profile, spread, is_offset_single,
                    simulate_overprint, box_mask=None,
                    cancel_event=None, signals=None, seq=0, use_cached_doc=True,
-                   draft_seq=0):
+                   draft_seq=0, object_filter=None):
         import fitz
         import numpy as np
         from PIL import Image
@@ -1507,7 +1526,8 @@ class PreflightWindow(QMainWindow):
 
         def _render_one(pn, doc, clip=None):
             return render_one_data(doc, pn, zoom, mode, channels, icc_path,
-                                    sim_profile, simulate_overprint, clip=clip)
+                                    sim_profile, simulate_overprint, clip=clip,
+                                    object_filter=object_filter)
 
         doc = None
         try:
@@ -1618,7 +1638,7 @@ class PreflightWindow(QMainWindow):
     @staticmethod
     def _render_to_entry(path, page_num, zoom, mode, channels,
                           icc_path, sim_profile, spread, is_offset_single,
-                          simulate_overprint, box_mask=None):
+                          simulate_overprint, box_mask=None, object_filter=None):
         result = {}
 
         class _Done:
@@ -1657,7 +1677,8 @@ class PreflightWindow(QMainWindow):
         PreflightWindow._render_bg(
             path, page_num, zoom, mode, channels, icc_path, sim_profile,
             spread, is_offset_single, simulate_overprint, box_mask,
-            cancel_event, _Signals(), 0, use_cached_doc=False)
+            cancel_event, _Signals(), 0, use_cached_doc=False,
+            object_filter=object_filter)
         return result.get('entry')
 
     def _on_page_done_ready(self, rgb_arr, boxes, zoom, has_op, cmyk_buf,
@@ -1748,10 +1769,11 @@ class PreflightWindow(QMainWindow):
         icc_path = get_cmyk_icc_path(self.render.doc)
         sim_profile = self.simulation.get_active_profile_path()
         simulate_op = self.chk_simulate_overprint.isChecked()
+        object_filter = self._object_filter_state()
         self._thumb_worker.submit_prefetch(
             path, render_page, zoom, mode, channels, icc_path, sim_profile,
             spread, is_offset_single, simulate_op, self._active_box_mask,
-            cache_key)
+            cache_key, object_filter)
 
     def _start_magnifier_cache_build(self):
         """Build magnifier cache on the worker thread so it's ready on right-click."""
@@ -2154,6 +2176,79 @@ class PreflightWindow(QMainWindow):
 
         blk.set_content(sw)
         self._collapse_blocks['separation'] = blk
+        vl.addWidget(blk)
+
+        # Object Filter
+        blk = CollapsibleBlock("Object Filter", "object_filter")
+        ow = QWidget()
+        ov = QVBoxLayout(ow)
+        ov.setContentsMargins(4, 4, 4, 4)
+        ov.setSpacing(4)
+
+        # Reserved row for the "View All" reset button (always occupies
+        # space so the layout does not jump).
+        self._of_reset_row = QWidget()
+        self._of_reset_row.setFixedHeight(30)
+        reset_hl = QHBoxLayout(self._of_reset_row)
+        reset_hl.setContentsMargins(4, 2, 4, 2)
+        self._of_reset_btn = QPushButton("View All")
+        from PyQt6.QtWidgets import QStyle
+        self._of_reset_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self._of_reset_btn.setStyleSheet(
+            f"QPushButton {{ border: 1px solid {self._accent_color}; "
+            f"color: {self._accent_color}; border-radius: 4px; "
+            f"padding: 4px 12px; font-size: 8pt; }}"
+            f"QPushButton:hover {{ background: rgba(29, 233, 182, 0.1); }}")
+        self._of_reset_btn.clicked.connect(self._on_of_reset)
+        self._of_reset_btn.setVisible(False)
+        reset_hl.addWidget(self._of_reset_btn, 0, Qt.AlignmentFlag.AlignRight)
+        reset_hl.addStretch(1)
+        ov.addWidget(self._of_reset_row)
+
+        # Filter rows — simple checkboxes like Simulate Overprint, in 2 columns
+        from preview.object_filter import CATEGORIES, LABELS
+        self._of_rows = {}
+        of_grid = QWidget()
+        of_grid.setStyleSheet("background: transparent;")
+        of_gl = QGridLayout(of_grid)
+        of_gl.setContentsMargins(0, 0, 0, 0)
+        of_gl.setVerticalSpacing(3)
+        of_gl.setHorizontalSpacing(12)
+        col_width = max(len(LABELS[k].lower()) for k in CATEGORIES) * 8
+        of_gl.setColumnMinimumWidth(0, col_width)
+        of_gl.setColumnMinimumWidth(1, col_width)
+        col = {'images': 0, 'text': 1, 'solid': 0, 'gradient': 1,
+               'shading': 0, 'strokes': 1, 'vector': 0}
+        row_idx = {'images': 0, 'text': 0, 'solid': 1, 'gradient': 1,
+                    'shading': 2, 'strokes': 2, 'vector': 3}
+        for key in CATEGORIES:
+            cb = QCheckBox(LABELS[key].lower())
+            cb.setChecked(True)
+            cb.setStyleSheet(
+                "QCheckBox { font-size: 9pt; color: #fff; }"
+                "QCheckBox::indicator { width: 14px; height: 14px; }")
+            cb.toggled.connect(lambda checked, k=key: self._on_of_toggle(k, checked))
+            self._of_rows[key] = cb
+            of_gl.addWidget(cb, row_idx[key], col[key])
+        ov.addWidget(of_grid)
+
+        # Master enable / disable — must come LAST so all widgets exist
+        # when its toggled signal fires via setChecked(True).
+        self.chk_object_filter = QCheckBox("Object Filter")
+        self.chk_object_filter.setChecked(True)
+        self.chk_object_filter.setToolTip(
+            "Enable object-type visibility filtering.\n"
+            "When unchecked, all objects are shown.")
+        self.chk_object_filter.setStyleSheet(
+            "QCheckBox { font-size: 9pt; }"
+            "QCheckBox::indicator { width: 14px; height: 14px; }")
+        self.chk_object_filter.toggled.connect(self._on_of_master_toggled)
+        # Insert at the very top of the block (above reset + grid)
+        ov.insertWidget(0, self.chk_object_filter)
+
+        blk.set_content(ow)
+        self._collapse_blocks['object_filter'] = blk
         vl.addWidget(blk)
 
         # Page Boxes
@@ -3173,12 +3268,14 @@ class PreflightWindow(QMainWindow):
         icc_path = get_cmyk_icc_path(self.render.doc)
         sim_profile = self.simulation.get_active_profile_path()
         simulate_op = self.chk_simulate_overprint.isChecked()
+        object_filter = self._object_filter_state()
         self._detail_seq += 1
         self._detail_cancel = threading.Event()
         self._thumb_worker.submit_detail(
             self._current_path, self._current_page, detail_zoom,
             (cx0, cy0, cx1, cy1), self._mode, channels, icc_path,
-            sim_profile, simulate_op, self._detail_cancel, self._detail_seq)
+            sim_profile, simulate_op, self._detail_cancel, self._detail_seq,
+            object_filter)
 
     def _on_detail_ready(self, rgb_arr, clip, detail_zoom, seq):
         if seq != self._detail_seq or self._overview_active:
@@ -3543,6 +3640,79 @@ class PreflightWindow(QMainWindow):
             self._invalidate_thumb_cache()
         elif self._mode == "separation":
             self._start_bg_render()
+
+    # ---- Object Filter state & callbacks ---------------------------------
+
+    def _object_filter_state(self):
+        """Return dict of enabled categories, or None if nothing hidden."""
+        if not self.chk_object_filter.isChecked():
+            return None
+        enabled = {}
+        for key, cb in self._of_rows.items():
+            enabled[key] = cb.isChecked()
+        if all(enabled.values()):
+            return None
+        return enabled
+
+    def _object_filter_key(self):
+        state = self._object_filter_state()
+        if state is None:
+            return None
+        return frozenset(state.items())
+
+    def _on_of_master_toggled(self, checked):
+        for cb in self._of_rows.values():
+            cb.setEnabled(checked)
+        self._of_update_reset_visibility()
+        self._on_of_changed()
+
+    def _on_of_toggle(self, key, checked):
+        if key == 'vector':
+            sub_cats = ['solid', 'gradient', 'shading', 'strokes']
+            for sk in sub_cats:
+                if sk in self._of_rows:
+                    self._of_rows[sk].setEnabled(checked)
+        if not self._of_batch_update:
+            self._of_update_reset_visibility()
+            self._on_of_changed()
+
+    def _on_of_reset(self):
+        """Reset all categories to default (all on)."""
+        self._of_batch_update = True
+        self.chk_object_filter.setChecked(True)
+        for cb in self._of_rows.values():
+            cb.setChecked(True)
+            cb.setEnabled(True)
+        self._of_batch_update = False
+        self._of_update_reset_visibility()
+        self._on_of_changed()
+
+    def _of_is_default(self):
+        return not (
+            not self.chk_object_filter.isChecked()
+            or any(not cb.isChecked() for cb in self._of_rows.values())
+        )
+
+    def _of_update_reset_visibility(self):
+        self._of_reset_btn.setVisible(not self._of_is_default())
+
+    def _on_of_changed(self):
+        from preview.object_filter import clear_cache as of_clear_cache
+        of_clear_cache()
+        self._cache_clear()
+        if self._overview_active:
+            self._invalidate_thumb_cache()
+        else:
+            self._start_bg_render()
+
+    def _update_of_styles(self):
+        """Update filter checkbox styles on theme change."""
+        from preview.object_filter import LABELS
+        for key, cb in self._of_rows.items():
+            cb.setText(LABELS[key].lower())
+            cb.setStyleSheet(
+                "QCheckBox { font-size: 9pt; color: #fff; }"
+                "QCheckBox::indicator { width: 14px; height: 14px; }")
 
     # ===================== Overview (zoom-driven) =====================
     def _page_dims_for_fit(self, page_num):

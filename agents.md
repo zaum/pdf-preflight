@@ -20,3 +20,9 @@ I have read and understood the above instructions.
 - Hover (mouse move) must show the same exact stored CMYK values as a click, not an approximate rendered value.
 - Never convert CMYK ← RGB ← CMYK as a substitute for the true stored CMYK value.
 - Reference for correctness: Adobe Acrobat's Output Preview / Object Inspector.
+
+## Running / Testing the Application
+
+- After making a fix or change, **close the currently running instance** of the application (do not leave old instances running).
+- Then (re)launch the application, preferably using the `.bet` build/launch script (batch file) found in the project, or otherwise start it via the normal run command for the project.
+- Never run multiple instances of the application at the same time while verifying a fix.
