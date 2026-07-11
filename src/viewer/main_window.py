@@ -518,11 +518,13 @@ def _get_bg_icc_transform(icc_path):
         return transform
 
 def render_one_data(doc, page_num, zoom, mode, channels, icc_path,
-                    sim_profile, simulate_overprint):
+                    sim_profile, simulate_overprint, clip=None):
     """Render a single page to an RGB numpy array following the active
     mode (normal / overprint / separation), channels, ICC and simulation
     profile. Returns (rgb_arr, fast_rgb_arr, cmyk_arr, boxes, page_rect, has_op).
-    Used by both the full-page background render and the overview thumbnails."""
+    Used by both the full-page background render and the overview thumbnails.
+    When ``clip`` (a fitz.Rect in page coordinates) is given, only that region
+    is rendered — used for the high-resolution detail overlay tile."""
     import fitz
     import numpy as np
     from PIL import Image
@@ -539,7 +541,11 @@ def render_one_data(doc, page_num, zoom, mode, channels, icc_path,
                 if not simulate_overprint:
                     from viewer.render_engine import _disable_overprint
                     modified = _disable_overprint(doc)
-                pix_cmyk = pg.get_pixmap(matrix=mat, colorspace=fitz.csCMYK)
+                if clip is not None:
+                    pix_cmyk = pg.get_pixmap(matrix=mat, clip=clip,
+                                             colorspace=fitz.csCMYK)
+                else:
+                    pix_cmyk = pg.get_pixmap(matrix=mat, colorspace=fitz.csCMYK)
             finally:
                 fitz.TOOLS.set_icc(old_icc)
                 if modified:
@@ -632,6 +638,7 @@ class FitzThumbWorker(QObject):
     page_done_ready = pyqtSignal(object, object, float, bool, object, object, float, int, object)
     mag_cache_ready = pyqtSignal(object, object)
     prefetch_done = pyqtSignal(object, object)
+    detail_ready = pyqtSignal(object, object, float, int)
 
     def __init__(self):
         super().__init__()
@@ -718,6 +725,8 @@ class FitzThumbWorker(QObject):
                 self._process_mag(item)
             elif kind == 'prefetch':
                 self._process_prefetch(item)
+            elif kind == 'detail':
+                self._process_detail(item)
 
     def _process_page(self, item):
         import fitz
@@ -890,6 +899,35 @@ class FitzThumbWorker(QObject):
         except Exception:
             pass
 
+    def _process_detail(self, item):
+        import fitz
+
+        (_, path, page_num, zoom, clip, mode, channels, icc_path,
+         sim_profile, simulate_overprint, cancel_event, seq) = item
+
+        if cancel_event.is_set() or self._cancel.is_set():
+            return
+        doc = self._get_doc(path)
+        try:
+            clip_rect = fitz.Rect(*clip)
+            rgb_arr, _, _, _, _, _ = render_one_data(
+                doc, page_num, zoom, mode, channels, icc_path,
+                sim_profile, simulate_overprint, clip=clip_rect)
+            if cancel_event.is_set() or self._cancel.is_set():
+                return
+            if rgb_arr is None or rgb_arr.size == 0:
+                return
+            self.detail_ready.emit(rgb_arr, clip, zoom, seq)
+        except Exception:
+            pass
+
+    def submit_detail(self, path, page_num, zoom, clip, mode, channels,
+                      icc_path, sim_profile, simulate_overprint,
+                      cancel_event, seq):
+        self._queue.put(('detail', path, page_num, zoom, clip, mode, channels,
+                         icc_path, sim_profile, simulate_overprint,
+                         cancel_event, seq))
+
     def submit_thumb(self, path, page_index, ov_scale, mode, channels,
                      sim_profile, op):
         self._queue.put(('thumb', path, page_index, ov_scale, mode, channels,
@@ -962,6 +1000,11 @@ class PreflightWindow(QMainWindow):
         self._recent_files = self._load_recent()
         self._current_path = None
         self._MAX_RENDER_ZOOM = 5.0
+        self._DETAIL_MAX_ZOOM = 20.0
+        self._detail_seq = 0
+        self._detail_cancel = threading.Event()
+        self._detail_timer = None
+        self._DETAIL_RENDER_DELAY_MS = 140
         self._accent_color = '#1de9b6'
         self._muted_color = 'rgba(224, 224, 224, 0.35)'
         self._last_render_zoom = 0.0  # 0 = no pixmap yet
@@ -1009,6 +1052,7 @@ class PreflightWindow(QMainWindow):
         self._thumb_worker.page_draft_ready.connect(self._on_page_draft_done)
         self._thumb_worker.mag_cache_ready.connect(self._on_mag_cache_ready)
         self._thumb_worker.prefetch_done.connect(self._on_prefetch_done)
+        self._thumb_worker.detail_ready.connect(self._on_detail_ready)
         self._setup_shortcuts()
         self._connect_signals()
         mode = str(self._settings.value("ui/theme_mode", "dark"))
@@ -1073,6 +1117,7 @@ class PreflightWindow(QMainWindow):
         self.page_widget.exit_overview()
         self.page_widget.scene.clear()
         self.page_widget.pixmap_item = None
+        self.page_widget._detail_item = None
         self.setWindowTitle("PDF Preflight Viewer")
         self.simulation.clear_simulation_profile()
         if hasattr(self, '_populate_sim_profiles'):
@@ -2771,6 +2816,8 @@ class PreflightWindow(QMainWindow):
         self._render_cancel.set()
         self._render_seq += 1
         self._render_cancel = threading.Event()
+        self._detail_seq += 1
+        self._detail_cancel.set()
 
     def _join_background_fitz_threads(self):
         """Cancel all pending background fitz work.
@@ -2799,6 +2846,10 @@ class PreflightWindow(QMainWindow):
                 sc.x() / self._last_render_zoom,
                 sc.y() / self._last_render_zoom)
 
+        self._detail_seq += 1
+        self._detail_cancel.set()
+        self.page_widget.clear_detail_overlay()
+        self._suppress_pan_detail = True
         self.page_widget.set_interactive_transform_quality(True)
         self.page_widget.resetTransform()
         scale = self._zoom / self._last_render_zoom
@@ -2809,6 +2860,7 @@ class PreflightWindow(QMainWindow):
                 QPointF(pdf_center.x() * self._last_render_zoom,
                         pdf_center.y() * self._last_render_zoom))
         self.page_widget.viewport().update()
+        self._suppress_pan_detail = False
 
     def _schedule_info_update(self, delay_ms=None):
         if delay_ms is None:
@@ -2878,6 +2930,103 @@ class PreflightWindow(QMainWindow):
         self._last_render_zoom = zoom
         self._schedule_magnifier_cache_build()
         self._warm_caches()
+        self._schedule_detail_render()
+
+    def _schedule_detail_render(self):
+        """Debounced request for the high-resolution detail overlay tile."""
+        self._detail_seq += 1
+        self._detail_cancel.set()
+        if not self._detail_needed():
+            self.page_widget.clear_detail_overlay()
+            return
+        if self._detail_timer is None:
+            self._detail_timer = QTimer(self)
+            self._detail_timer.setSingleShot(True)
+            self._detail_timer.timeout.connect(self._do_detail_render)
+        self._detail_timer.start(self._DETAIL_RENDER_DELAY_MS)
+
+    def _detail_needed(self):
+        if self._overview_active or not self._current_path or not self.render.doc:
+            return False
+        if self._spread_mode() is not None:
+            return False
+        if self.page_widget.pixmap_item is None:
+            return False
+        if self._last_render_zoom <= 0:
+            return False
+        # Only enable the clipped high-res tile in modes where rendering a clip
+        # is pixel-identical to the full-page render. Overprint simulation maps
+        # object geometry from the page origin, so a clip would be misaligned —
+        # fall back to the (blurrier) upscale in those modes to keep colors exact.
+        if self._mode == 'overprint':
+            return False
+        if self._mode == 'separation' and self.chk_simulate_overprint.isChecked():
+            return False
+        return self._zoom > self._last_render_zoom * 1.01
+
+    def _do_detail_render(self):
+        if not self._detail_needed():
+            self.page_widget.clear_detail_overlay()
+            return
+        base_zoom = self._last_render_zoom
+        try:
+            page_rect = self.render.doc[self._current_page].rect
+        except Exception:
+            return
+        pw, ph = page_rect.width, page_rect.height
+
+        vp = self.page_widget.viewport().rect()
+        if vp.width() <= 0 or vp.height() <= 0:
+            return
+        tl = self.page_widget.mapToScene(vp.topLeft())
+        br = self.page_widget.mapToScene(vp.bottomRight())
+        sx0, sx1 = min(tl.x(), br.x()), max(tl.x(), br.x())
+        sy0, sy1 = min(tl.y(), br.y()), max(tl.y(), br.y())
+
+        cx0 = sx0 / base_zoom
+        cy0 = sy0 / base_zoom
+        cx1 = sx1 / base_zoom
+        cy1 = sy1 / base_zoom
+        mx = (cx1 - cx0) * 0.08
+        my = (cy1 - cy0) * 0.08
+        cx0 = max(0.0, cx0 - mx)
+        cy0 = max(0.0, cy0 - my)
+        cx1 = min(pw, cx1 + mx)
+        cy1 = min(ph, cy1 + my)
+        if cx1 - cx0 < 1.0 or cy1 - cy0 < 1.0:
+            self.page_widget.clear_detail_overlay()
+            return
+
+        detail_zoom = min(self._zoom, self._DETAIL_MAX_ZOOM)
+        channels = {
+            'cyan': self.chk_c.isChecked(),
+            'magenta': self.chk_m.isChecked(),
+            'yellow': self.chk_y.isChecked(),
+            'black': self.chk_k.isChecked(),
+        }
+        icc_path = get_cmyk_icc_path(self.render.doc)
+        sim_profile = self.simulation.get_active_profile_path()
+        simulate_op = self.chk_simulate_overprint.isChecked()
+        self._detail_seq += 1
+        self._detail_cancel = threading.Event()
+        self._thumb_worker.submit_detail(
+            self._current_path, self._current_page, detail_zoom,
+            (cx0, cy0, cx1, cy1), self._mode, channels, icc_path,
+            sim_profile, simulate_op, self._detail_cancel, self._detail_seq)
+
+    def _on_detail_ready(self, rgb_arr, clip, detail_zoom, seq):
+        if seq != self._detail_seq or self._overview_active:
+            return
+        if self.page_widget.pixmap_item is None or self._last_render_zoom <= 0:
+            return
+        h, w = rgb_arr.shape[:2]
+        qimg = QImage(rgb_arr.data, w, h, w * 3,
+                      QImage.Format.Format_RGB888).copy()
+        base_zoom = self._last_render_zoom
+        cx0, cy0, _, _ = clip
+        item_scale = base_zoom / detail_zoom
+        self.page_widget.set_detail_overlay(
+            qimg, cx0 * base_zoom, cy0 * base_zoom, item_scale)
 
     def _warm_caches(self):
         """Pre-warm content stream and overprint caches in background."""
@@ -3288,7 +3437,17 @@ class PreflightWindow(QMainWindow):
             max_w = max(max_w, row_w)
             y += max_h + gap
         total_h = y - gap if y > 0 else 0
-        scene_rect = QRectF(-max_w / 2.0, 0.0, max_w, total_h)
+        # Reserve horizontal room for the page-number labels drawn beside the
+        # pages (outside), so they aren't clipped when the view fits to width.
+        from PyQt6.QtGui import QFont, QFontMetricsF
+        scale = (self._zoom / ov_scale) if ov_scale > 0 else 1.0
+        lf = QFont("sans-serif")
+        lf.setPixelSize(max(1, int(13 / scale)))
+        lf.setBold(True)
+        fm = QFontMetricsF(lf)
+        label_gutter = fm.horizontalAdvance(str(count)) + 20.0 / scale
+        scene_rect = QRectF(-(max_w / 2.0 + label_gutter), 0.0,
+                            max_w + 2.0 * label_gutter, total_h)
         return entries, scene_rect
 
     def _enter_overview(self, rebuild=False):
@@ -3447,6 +3606,8 @@ class PreflightWindow(QMainWindow):
 
     def _on_overview_scroll(self, value=None):
         if not self._overview_active:
+            if not getattr(self, '_suppress_pan_detail', False):
+                self._schedule_detail_render()
             return
         self._request_visible_thumbs()
         if getattr(self, '_overview_center_lock', False):

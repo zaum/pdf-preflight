@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt6.QtCore import Qt, QPointF, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import (QPainter, QPixmap, QColor, QPen, QBrush,
-                         QTransform, QPainterPath, QFont)
+                         QTransform, QPainterPath, QFont, QFontMetricsF)
 import math
 import time
 from collections import OrderedDict
@@ -26,6 +26,7 @@ class PageWidget(QGraphicsView):
         self.setScene(self.scene)
 
         self.pixmap_item = None
+        self._detail_item = None
         self._page = None
         self._render_zoom = 1.0
         self._overlay = BoxOverlay()
@@ -129,6 +130,7 @@ class PageWidget(QGraphicsView):
         if cmyk_buf is not None:
             self._source_cmyk = cmyk_buf
         self.scene.clear()
+        self._detail_item = None
         self.pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(qimage))
         self.pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self.scene.addItem(self.pixmap_item)
@@ -136,6 +138,32 @@ class PageWidget(QGraphicsView):
         margin_w = max(r.width(), self.viewport().width()) * 2.0
         margin_h = max(r.height(), self.viewport().height()) * 2.0
         self.scene.setSceneRect(r.adjusted(-margin_w, -margin_h, margin_w, margin_h))
+
+    def set_detail_overlay(self, qimage, scene_x, scene_y, item_scale):
+        """Place a high-resolution detail tile on top of the base pixmap.
+
+        The tile covers only the visible region but is rendered at the true
+        display zoom, so it appears vector-sharp. ``item_scale`` maps the tile's
+        native pixels back to the base-render scene units."""
+        if self.pixmap_item is None or self.pixmap_item.scene() is None:
+            return
+        self.clear_detail_overlay()
+        item = QGraphicsPixmapItem(QPixmap.fromImage(qimage))
+        item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        item.setScale(item_scale)
+        item.setPos(scene_x, scene_y)
+        item.setZValue(1.0)
+        self.scene.addItem(item)
+        self._detail_item = item
+
+    def clear_detail_overlay(self):
+        if self._detail_item is not None:
+            try:
+                if self._detail_item.scene() is not None:
+                    self.scene.removeItem(self._detail_item)
+            except Exception:
+                pass
+            self._detail_item = None
 
     def set_interactive_transform_quality(self, interactive):
         if self.pixmap_item is None or self.pixmap_item.scene() is None:
@@ -271,6 +299,7 @@ class PageWidget(QGraphicsView):
         self._clear_magnifier_state()
         self.scene.clear()
         self.pixmap_item = None
+        self._detail_item = None
         self._page = None
         self._source_qimage = None
         self._source_cmyk = None
@@ -396,6 +425,9 @@ class PageWidget(QGraphicsView):
         label_font = QFont("sans-serif")
         label_font.setPixelSize(max(1, int(13 / scale)))
         label_font.setBold(True)
+        fm = QFontMetricsF(label_font)
+        lh = fm.height()
+        lpad = 14.0 / scale
 
         for e in self._overview_entries:
             rects = [e['rect']]
@@ -403,6 +435,7 @@ class PageWidget(QGraphicsView):
                 rects.append(e['rect2'])
             if not any(r.intersects(sr) for r in rects):
                 continue
+            is_pair = e.get('is_pair')
             for ri, r in enumerate(rects):
                 pn = e['pages'][ri] if ri < len(e['pages']) else e['pages'][0]
                 painter.fillRect(r, self._overview_paper)
@@ -413,13 +446,21 @@ class PageWidget(QGraphicsView):
                     painter.fillRect(r, self._overview_placeholder)
                 painter.setPen(QPen(self._overview_border, 1.0 / scale))
                 painter.drawRect(r)
-                # page number label inside bottom of the page
+                # page number label OUTSIDE, beside the page (pair-aware):
+                # single/left page -> to the left; right page of a pair -> right
+                text = str(pn + 1)
+                tw = fm.horizontalAdvance(text)
+                cy = r.center().y()
+                on_right = is_pair and ri == 1
+                if on_right:
+                    lr = QRectF(r.right() + lpad, cy - lh / 2, tw, lh)
+                    align = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                else:
+                    lr = QRectF(r.left() - lpad - tw, cy - lh / 2, tw, lh)
+                    align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                 painter.setPen(self._overview_label)
                 painter.setFont(label_font)
-                painter.drawText(
-                    r.adjusted(0, 0, 0, 0),
-                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
-                    str(pn + 1))
+                painter.drawText(lr, align, text)
             # current-page highlight across the whole entry
             if (e['pages'][0] == self._overview_current
                     or (e.get('is_pair')
