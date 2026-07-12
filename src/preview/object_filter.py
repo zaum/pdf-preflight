@@ -31,7 +31,7 @@ LABELS = {
     'gradient': "Gradient Color",
     'shading': "Shadings",
     'strokes': "Strokes",
-    'vector': "Vector",
+    'vector': "All Vector",
 }
 
 # Accent color per category, used only for the small toggle indicator.
@@ -84,143 +84,210 @@ def _is_hidden(d, enabled):
     return False
 
 
-def _replay(shape, d):
-    for item in d.get('items', []):
-        kind = item[0]
-        if kind == 'l':
-            shape.draw_line(item[1], item[2])
-        elif kind == 'c':
-            shape.draw_bezier(item[1], item[2], item[3], item[4])
-        elif kind == 're':
-            shape.draw_rect(item[1])
-        elif kind == 'qu':
-            shape.draw_quad(item[1])
-
-
-_WHITE = (1, 1, 1)
-_BLACK = (0, 0, 0)
-
-
-def build_object_mask(page, zoom, enabled, clip=None):
-    """Return a boolean (H, W) mask that is True where a *disabled*
-    category covers pixels. Pixels set to True will be hidden."""
-    doc = fitz.open()
+def collect_hidden_vector_rects(page, enabled):
+    """Return the bounding rects of every drawing that belongs to a disabled
+    vector sub-category (partial selection). Used to remove exactly those
+    drawings from the content stream so that objects drawn *on top* of them
+    (images, text, other vectors) are preserved."""
+    rects = []
     try:
-        doc.insert_page(-1, width=page.rect.width, height=page.rect.height)
-        mp = doc[0]
-        # Black background so drawn (white) objects show up as bright.
-        mp.draw_rect(fitz.Rect(0, 0, mp.rect.width, mp.rect.height),
-                     color=_BLACK, fill=_BLACK, width=0)
-
-        try:
-            drawings = page.get_drawings()
-        except Exception:
-            drawings = []
-
-        for d in drawings:
+        for d in page.get_drawings():
             if not _is_hidden(d, enabled):
                 continue
-            sh = mp.new_shape()
-            _replay(sh, d)
-            has_fill = d.get('fill') is not None
-            has_stroke = d.get('color') is not None
-            try:
-                sh.finish(
-                    fill=_WHITE if has_fill else None,
-                    color=_WHITE if has_stroke else None,
-                    width=d.get('width', 1),
-                    lineCap=d.get('lineCap', 0),
-                    lineJoin=d.get('lineJoin', 0),
-                    dashes=d.get('dashes'),
-                    even_odd=d.get('even_odd', False),
-                )
-                sh.commit()
-            except Exception:
-                pass
+            r = d.get('rect')
+            if r is not None:
+                rects.append(fitz.Rect(r))
+    except Exception:
+        pass
+    return rects
 
-        if not enabled.get('text', True):
-            try:
-                td = page.get_text('dict')
-                for b in td.get('blocks', []):
-                    if b.get('type') != 0:
-                        continue
-                    for line in b.get('lines', []):
-                        for span in line.get('spans', []):
-                            bbox = span.get('bbox')
-                            if bbox:
-                                mp.draw_rect(fitz.Rect(*bbox), color=_WHITE,
-                                             fill=_WHITE, width=0)
-            except Exception:
-                pass
 
-        if not enabled.get('images', True):
-            try:
-                for im in page.get_image_info():
-                    bbox = im.get('bbox')
-                    if bbox:
-                        mp.draw_rect(fitz.Rect(*bbox), color=_WHITE,
-                                     fill=_WHITE, width=0)
-            except Exception:
-                pass
+# Cache of already-redacted temp documents, keyed by the removal plan. The
+# expensive part (copying the page + applying redactions) is independent of
+# zoom/clip, so we build the filtered page ONCE and reuse it for every zoom
+# level and detail tile. The rendered pixmap itself is cheap per zoom.
+_FILTERED_DOC_CACHE = {}
+_FILTERED_DOC_ORDER = []
 
-        mat = fitz.Matrix(zoom, zoom)
-        pix = mp.get_pixmap(matrix=mat, clip=clip,
-                             colorspace=fitz.csGRAY, alpha=False)
+
+def _build_filtered_page(page, remove_images, remove_text, remove_vector,
+                         vector_rects):
+    """Return a temp (document, page) with the requested object categories
+    removed from the content stream. Redactions are applied with a single
+    full-page annotation per pass (instead of one per object), which is orders
+    of magnitude faster for text-heavy pages."""
+    try:
+        src = page.parent
+        pno = page.number
+    except Exception:
+        return None, None
+    tmp = fitz.open()
+    try:
+        tmp.insert_pdf(src, from_page=pno, to_page=pno)
+        tp = tmp[0]
+
+        # Images / text / full-vector: a single full-page redaction removes all
+        # objects of the selected categories in one apply_redactions call.
+        if remove_images or remove_text or remove_vector:
+            tp.add_redact_annot(tp.rect, fill=False)
+            tp.apply_redactions(
+                images=(fitz.PDF_REDACT_IMAGE_REMOVE if remove_images
+                        else fitz.PDF_REDACT_IMAGE_NONE),
+                graphics=(fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED
+                          if remove_vector
+                          else fitz.PDF_REDACT_LINE_ART_NONE),
+                text=(fitz.PDF_REDACT_TEXT_REMOVE if remove_text
+                      else fitz.PDF_REDACT_TEXT_NONE),
+            )
+        elif vector_rects:
+            # Partial vector selection: remove only the specific disabled
+            # drawings. REMOVE_IF_COVERED drops a path only when its bounding
+            # box is contained in a redaction rect, so objects drawn on top
+            # (images, text) survive and the background shows through.
+            for r in vector_rects:
+                tp.add_redact_annot(fitz.Rect(r), fill=False)
+            tp.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                text=fitz.PDF_REDACT_TEXT_NONE,
+            )
+        return tmp, tp
     except Exception:
         try:
-            doc.close()
+            tmp.close()
         except Exception:
             pass
-        return None
-    finally:
-        pass
+        return None, None
 
+
+def _get_filtered_page(page, plan_key, remove_images, remove_text,
+                       remove_vector, vector_rects):
+    cached = _FILTERED_DOC_CACHE.get(plan_key)
+    if cached is not None:
+        return cached[1]
+    tmp, tp = _build_filtered_page(
+        page, remove_images, remove_text, remove_vector, vector_rects)
+    if tmp is None:
+        return None
+    _FILTERED_DOC_CACHE[plan_key] = (tmp, tp)
+    _FILTERED_DOC_ORDER.append(plan_key)
+    while len(_FILTERED_DOC_ORDER) > 4:
+        old = _FILTERED_DOC_ORDER.pop(0)
+        entry = _FILTERED_DOC_CACHE.pop(old, None)
+        if entry is not None:
+            try:
+                entry[0].close()
+            except Exception:
+                pass
+    return tp
+
+
+def build_filtered_cmyk(page, zoom, clip=None, remove_images=False,
+                        remove_text=False, remove_vector=False,
+                        vector_rects=None, plan_key=None):
+    """Render the page to CMYK with whole object categories *removed* from the
+    content stream, revealing whatever is drawn behind them (Acrobat Output
+    Preview behaviour). The redacted page is cached per removal plan and reused
+    across zoom levels, so only the (cheap) pixmap render happens per zoom."""
+    if not (remove_images or remove_text or remove_vector or vector_rects):
+        return None
+    if plan_key is None:
+        plan_key = (
+            id(page.parent), page.xref, remove_images, remove_text,
+            remove_vector,
+            tuple(tuple(r) for r in vector_rects) if vector_rects else None,
+        )
+    tp = _get_filtered_page(page, plan_key, remove_images, remove_text,
+                            remove_vector, vector_rects)
+    if tp is None:
+        return None
     try:
+        mat = fitz.Matrix(zoom, zoom)
+        pix = tp.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csCMYK)
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-            pix.height, pix.width)
+            pix.height, pix.width, 4).copy()
     except Exception:
         arr = None
-    try:
-        doc.close()
-    except Exception:
-        pass
-    if arr is None:
-        return None
-    return arr > 128
+    return arr
 
 
-_MASK_CACHE = {}
+_BG_CACHE = {}
+
+
+_VECTOR_SUBS = ('solid', 'gradient', 'shading', 'strokes')
 
 
 def apply_object_filter(cmyk_arr, page, zoom, enabled, clip=None):
-    """Zero (paper white) every CMYK pixel covered by a disabled category."""
+    """Remove every disabled object category from the CMYK render.
+
+    All categories are removed by re-rendering the page with the corresponding
+    objects stripped from the content stream, so the content *behind* them
+    shows through instead of a white box (matching Acrobat's Output Preview)
+    and objects drawn *on top* of them are preserved. A partial vector
+    selection removes only the specific disabled drawings.
+    """
     if cmyk_arr is None or enabled is None:
         return cmyk_arr
     if all(enabled.get(k, True) for k in CATEGORIES):
         return cmyk_arr
 
-    cache_key = (
-        id(page.parent) if hasattr(page, 'parent') else id(page),
-        page.xref,
-        round(zoom, 4),
-        frozenset((k, bool(v)) for k, v in enabled.items()),
-        tuple(clip) if clip is not None else None,
-    )
-    mask = _MASK_CACHE.get(cache_key)
-    if mask is None:
-        mask = build_object_mask(page, zoom, enabled, clip=clip)
-        if len(_MASK_CACHE) > 8:
-            _MASK_CACHE.clear()
-        if mask is not None:
-            _MASK_CACHE[cache_key] = mask
+    doc_id = id(page.parent) if hasattr(page, 'parent') else id(page)
+    clip_key = tuple(clip) if clip is not None else None
 
-    if mask is None or mask.shape != cmyk_arr.shape[:2]:
+    remove_images = not enabled.get('images', True)
+    remove_text = not enabled.get('text', True)
+    # Full vector removal when the umbrella is off or every sub-category is off.
+    remove_vector = (not enabled.get('vector', True)) or all(
+        not enabled.get(s, True) for s in _VECTOR_SUBS)
+
+    # Partial vector selection: collect the rects of the disabled drawings so
+    # only those specific objects are removed (objects on top survive).
+    vector_rects = None
+    if not remove_vector:
+        me = {k: True for k in CATEGORIES}
+        partial = False
+        for s in _VECTOR_SUBS:
+            if not enabled.get(s, True):
+                me[s] = False
+                partial = True
+        if partial:
+            rects = collect_hidden_vector_rects(page, me)
+            if rects:
+                vector_rects = rects
+
+    if not (remove_images or remove_text or remove_vector or vector_rects):
         return cmyk_arr
 
-    out = cmyk_arr.copy()
-    out[mask] = 0
-    return out
+    vector_key = (
+        tuple(tuple(r) for r in vector_rects) if vector_rects else None)
+    # The redacted page depends only on doc + page + removal plan (zoom-free).
+    plan_key = (doc_id, page.xref, remove_images, remove_text,
+                remove_vector, vector_key)
+    # The rendered CMYK array additionally depends on zoom + clip.
+    bg_key = plan_key + (round(zoom, 4), clip_key)
+
+    bg = _BG_CACHE.get(bg_key)
+    if bg is None:
+        bg = build_filtered_cmyk(
+            page, zoom, clip=clip, remove_images=remove_images,
+            remove_text=remove_text, remove_vector=remove_vector,
+            vector_rects=vector_rects, plan_key=plan_key)
+        if len(_BG_CACHE) > 8:
+            _BG_CACHE.clear()
+        if bg is not None:
+            _BG_CACHE[bg_key] = bg
+
+    if bg is not None and bg.shape == cmyk_arr.shape:
+        return bg
+    return cmyk_arr
 
 
 def clear_cache():
-    _MASK_CACHE.clear()
+    _BG_CACHE.clear()
+    for entry in _FILTERED_DOC_CACHE.values():
+        try:
+            entry[0].close()
+        except Exception:
+            pass
+    _FILTERED_DOC_CACHE.clear()
+    _FILTERED_DOC_ORDER.clear()

@@ -2179,73 +2179,85 @@ class PreflightWindow(QMainWindow):
         vl.addWidget(blk)
 
         # Object Filter
+        from PyQt6.QtWidgets import QStyle, QFrame
         blk = CollapsibleBlock("Object Filter", "object_filter")
         ow = QWidget()
         ov = QVBoxLayout(ow)
         ov.setContentsMargins(4, 4, 4, 4)
         ov.setSpacing(4)
 
-        # Reserved row for the "View All" reset button (always occupies
-        # space so the layout does not jump).
+        from preview.object_filter import CATEGORIES, LABELS
+        self._of_rows = {}
+
+        def _make_of_cb(key):
+            cb = QCheckBox(LABELS[key].lower())
+            cb.setChecked(True)
+            cb.setStyleSheet(
+                "QCheckBox { font-size: 9pt; color: #fff; background: transparent; }"
+                "QCheckBox::indicator { width: 14px; height: 14px; }")
+            cb.toggled.connect(
+                lambda checked, k=key: self._on_of_toggle(k, checked))
+            self._of_rows[key] = cb
+            return cb
+
+        # Two columns: left = images / text, right = framed vector group.
+        cols_hl = QHBoxLayout()
+        cols_hl.setContentsMargins(0, 0, 0, 0)
+        cols_hl.setSpacing(12)
+
+        left_col = QWidget()
+        left_col.setStyleSheet("background: transparent;")
+        left_vl = QVBoxLayout(left_col)
+        left_vl.setContentsMargins(0, 0, 0, 0)
+        left_vl.setSpacing(3)
+        left_vl.addWidget(_make_of_cb('images'))
+        left_vl.addWidget(_make_of_cb('text'))
+        left_vl.addStretch(1)
+        cols_hl.addWidget(left_col, 0, Qt.AlignmentFlag.AlignTop)
+
+        # Right column: framed group whose "all vector" master toggles the
+        # solid / gradient / shading / strokes sub-categories.
+        self._of_vector_frame = QFrame()
+        self._of_vector_frame.setStyleSheet(
+            "QFrame { border: 1px solid rgba(255,255,255,0.25); "
+            "border-radius: 4px; background: transparent; }")
+        vec_vl = QVBoxLayout(self._of_vector_frame)
+        vec_vl.setContentsMargins(6, 4, 6, 4)
+        vec_vl.setSpacing(3)
+        vec_vl.addWidget(_make_of_cb('vector'))
+
+        vec_sub = QWidget()
+        vec_sub.setStyleSheet("background: transparent; border: none;")
+        vec_sub_vl = QVBoxLayout(vec_sub)
+        vec_sub_vl.setContentsMargins(14, 0, 0, 0)
+        vec_sub_vl.setSpacing(3)
+        for sk in ('solid', 'gradient', 'shading', 'strokes'):
+            vec_sub_vl.addWidget(_make_of_cb(sk))
+        vec_vl.addWidget(vec_sub)
+        cols_hl.addWidget(self._of_vector_frame, 1, Qt.AlignmentFlag.AlignTop)
+
+        ov.addLayout(cols_hl)
+
+        # "View All" reset button below all filters.
         self._of_reset_row = QWidget()
         self._of_reset_row.setFixedHeight(30)
         reset_hl = QHBoxLayout(self._of_reset_row)
         reset_hl.setContentsMargins(4, 2, 4, 2)
+        reset_hl.addStretch(1)
         self._of_reset_btn = QPushButton("View All")
-        from PyQt6.QtWidgets import QStyle
         self._of_reset_btn.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self._of_reset_btn.setStyleSheet(
             f"QPushButton {{ border: 1px solid {self._accent_color}; "
             f"color: {self._accent_color}; border-radius: 4px; "
             f"padding: 4px 12px; font-size: 8pt; }}"
-            f"QPushButton:hover {{ background: rgba(29, 233, 182, 0.1); }}")
+            f"QPushButton:hover {{ background: rgba(29, 233, 182, 0.1); }}"
+            f"QPushButton:disabled {{ border: 1px solid #777; "
+            f"color: #777; background: transparent; }}")
         self._of_reset_btn.clicked.connect(self._on_of_reset)
-        self._of_reset_btn.setVisible(False)
+        self._of_reset_btn.setEnabled(False)
         reset_hl.addWidget(self._of_reset_btn, 0, Qt.AlignmentFlag.AlignRight)
-        reset_hl.addStretch(1)
         ov.addWidget(self._of_reset_row)
-
-        # Filter rows — simple checkboxes like Simulate Overprint, in 2 columns
-        from preview.object_filter import CATEGORIES, LABELS
-        self._of_rows = {}
-        of_grid = QWidget()
-        of_grid.setStyleSheet("background: transparent;")
-        of_gl = QGridLayout(of_grid)
-        of_gl.setContentsMargins(0, 0, 0, 0)
-        of_gl.setVerticalSpacing(3)
-        of_gl.setHorizontalSpacing(12)
-        col_width = max(len(LABELS[k].lower()) for k in CATEGORIES) * 8
-        of_gl.setColumnMinimumWidth(0, col_width)
-        of_gl.setColumnMinimumWidth(1, col_width)
-        col = {'images': 0, 'text': 1, 'solid': 0, 'gradient': 1,
-               'shading': 0, 'strokes': 1, 'vector': 0}
-        row_idx = {'images': 0, 'text': 0, 'solid': 1, 'gradient': 1,
-                    'shading': 2, 'strokes': 2, 'vector': 3}
-        for key in CATEGORIES:
-            cb = QCheckBox(LABELS[key].lower())
-            cb.setChecked(True)
-            cb.setStyleSheet(
-                "QCheckBox { font-size: 9pt; color: #fff; }"
-                "QCheckBox::indicator { width: 14px; height: 14px; }")
-            cb.toggled.connect(lambda checked, k=key: self._on_of_toggle(k, checked))
-            self._of_rows[key] = cb
-            of_gl.addWidget(cb, row_idx[key], col[key])
-        ov.addWidget(of_grid)
-
-        # Master enable / disable — must come LAST so all widgets exist
-        # when its toggled signal fires via setChecked(True).
-        self.chk_object_filter = QCheckBox("Object Filter")
-        self.chk_object_filter.setChecked(True)
-        self.chk_object_filter.setToolTip(
-            "Enable object-type visibility filtering.\n"
-            "When unchecked, all objects are shown.")
-        self.chk_object_filter.setStyleSheet(
-            "QCheckBox { font-size: 9pt; }"
-            "QCheckBox::indicator { width: 14px; height: 14px; }")
-        self.chk_object_filter.toggled.connect(self._on_of_master_toggled)
-        # Insert at the very top of the block (above reset + grid)
-        ov.insertWidget(0, self.chk_object_filter)
 
         blk.set_content(ow)
         self._collapse_blocks['object_filter'] = blk
@@ -3645,8 +3657,6 @@ class PreflightWindow(QMainWindow):
 
     def _object_filter_state(self):
         """Return dict of enabled categories, or None if nothing hidden."""
-        if not self.chk_object_filter.isChecked():
-            return None
         enabled = {}
         for key, cb in self._of_rows.items():
             enabled[key] = cb.isChecked()
@@ -3659,12 +3669,6 @@ class PreflightWindow(QMainWindow):
         if state is None:
             return None
         return frozenset(state.items())
-
-    def _on_of_master_toggled(self, checked):
-        for cb in self._of_rows.values():
-            cb.setEnabled(checked)
-        self._of_update_reset_visibility()
-        self._on_of_changed()
 
     def _on_of_toggle(self, key, checked):
         if key == 'vector':
@@ -3679,7 +3683,6 @@ class PreflightWindow(QMainWindow):
     def _on_of_reset(self):
         """Reset all categories to default (all on)."""
         self._of_batch_update = True
-        self.chk_object_filter.setChecked(True)
         for cb in self._of_rows.values():
             cb.setChecked(True)
             cb.setEnabled(True)
@@ -3688,13 +3691,10 @@ class PreflightWindow(QMainWindow):
         self._on_of_changed()
 
     def _of_is_default(self):
-        return not (
-            not self.chk_object_filter.isChecked()
-            or any(not cb.isChecked() for cb in self._of_rows.values())
-        )
+        return not any(not cb.isChecked() for cb in self._of_rows.values())
 
     def _of_update_reset_visibility(self):
-        self._of_reset_btn.setVisible(not self._of_is_default())
+        self._of_reset_btn.setEnabled(not self._of_is_default())
 
     def _on_of_changed(self):
         from preview.object_filter import clear_cache as of_clear_cache
