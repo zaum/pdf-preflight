@@ -2179,7 +2179,7 @@ class PreflightWindow(QMainWindow):
         vl.addWidget(blk)
 
         # Object Filter
-        from PyQt6.QtWidgets import QStyle, QFrame
+        from PyQt6.QtWidgets import QStyle
         blk = CollapsibleBlock("Object Filter", "object_filter")
         ow = QWidget()
         ov = QVBoxLayout(ow)
@@ -2200,43 +2200,9 @@ class PreflightWindow(QMainWindow):
             self._of_rows[key] = cb
             return cb
 
-        # Two columns: left = images / text, right = framed vector group.
-        cols_hl = QHBoxLayout()
-        cols_hl.setContentsMargins(0, 0, 0, 0)
-        cols_hl.setSpacing(12)
-
-        left_col = QWidget()
-        left_col.setStyleSheet("background: transparent;")
-        left_vl = QVBoxLayout(left_col)
-        left_vl.setContentsMargins(0, 0, 0, 0)
-        left_vl.setSpacing(3)
-        left_vl.addWidget(_make_of_cb('images'))
-        left_vl.addWidget(_make_of_cb('text'))
-        left_vl.addStretch(1)
-        cols_hl.addWidget(left_col, 0, Qt.AlignmentFlag.AlignTop)
-
-        # Right column: framed group whose "all vector" master toggles the
-        # solid / gradient / shading / strokes sub-categories.
-        self._of_vector_frame = QFrame()
-        self._of_vector_frame.setStyleSheet(
-            "QFrame { border: 1px solid rgba(255,255,255,0.25); "
-            "border-radius: 4px; background: transparent; }")
-        vec_vl = QVBoxLayout(self._of_vector_frame)
-        vec_vl.setContentsMargins(6, 4, 6, 4)
-        vec_vl.setSpacing(3)
-        vec_vl.addWidget(_make_of_cb('vector'))
-
-        vec_sub = QWidget()
-        vec_sub.setStyleSheet("background: transparent; border: none;")
-        vec_sub_vl = QVBoxLayout(vec_sub)
-        vec_sub_vl.setContentsMargins(14, 0, 0, 0)
-        vec_sub_vl.setSpacing(3)
-        for sk in ('solid', 'gradient', 'shading', 'strokes'):
-            vec_sub_vl.addWidget(_make_of_cb(sk))
-        vec_vl.addWidget(vec_sub)
-        cols_hl.addWidget(self._of_vector_frame, 1, Qt.AlignmentFlag.AlignTop)
-
-        ov.addLayout(cols_hl)
+        # Simple vertical list of the three object categories.
+        for key in ('images', 'text', 'vector'):
+            ov.addWidget(_make_of_cb(key))
 
         # "View All" reset button below all filters.
         self._of_reset_row = QWidget()
@@ -3671,11 +3637,6 @@ class PreflightWindow(QMainWindow):
         return frozenset(state.items())
 
     def _on_of_toggle(self, key, checked):
-        if key == 'vector':
-            sub_cats = ['solid', 'gradient', 'shading', 'strokes']
-            for sk in sub_cats:
-                if sk in self._of_rows:
-                    self._of_rows[sk].setEnabled(checked)
         if not self._of_batch_update:
             self._of_update_reset_visibility()
             self._on_of_changed()
