@@ -8,6 +8,12 @@ from collections import OrderedDict
 
 from .overlay import BoxOverlay
 
+# Hide the right-click magnifier when the page is already displayed at or above
+# this zoom. The page display zoom is capped at 5.0 (main_window._MAX_RENDER_ZOOM),
+# so the magnifier (fixed ~10x absolute) is only ever hidden near max zoom, where
+# it adds little over the already-large on-screen view.
+MAGNIFIER_HIDE_ZOOM = 4.5
+
 
 class PageWidget(QGraphicsView):
     clicked = pyqtSignal(object)
@@ -19,6 +25,7 @@ class PageWidget(QGraphicsView):
     page_activated = pyqtSignal(int)
     overview_clicked = pyqtSignal(int)
     view_resized = pyqtSignal()
+    magnifier_requested = pyqtSignal(float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -58,14 +65,17 @@ class PageWidget(QGraphicsView):
         self._magnifier_allowed = True
         self._source_qimage = None
         self._source_cmyk = None
-        self._magnifier_renderer = None
-        # Cached high-quality magnifier image (rendered off the paint path)
+        self._sampler_size = 1
+        # CMYK badge values for the magnifier, resolved on the main window
+        # (prefers the exact stored source color). Tuple of 4 floats (0..100),
+        # or None until the first resolution. _mag_badge_approx marks the
+        # rendered-only fallback (no resolvable exact source).
+        self._mag_badge_cmyk = None
+        self._mag_badge_approx = False
+        # Cached high-quality magnifier image (rendered off the paint path,
+        # asynchronously on the background render worker).
         self._mag_hq_img = None
         self._mag_hq_pos = None
-        self._mag_hq_timer = QTimer(self)
-        self._mag_hq_timer.setSingleShot(True)
-        self._mag_hq_timer.timeout.connect(self._render_hq_magnifier)
-        self._mag_hq_pos_pending = None
         self._click_timer = QTimer(self)
         self._click_timer.setSingleShot(True)
         self._click_timer.timeout.connect(self._emit_deferred_click)
@@ -129,6 +139,8 @@ class PageWidget(QGraphicsView):
         self._source_qimage = qimage
         if cmyk_buf is not None:
             self._source_cmyk = cmyk_buf
+        self._mag_badge_cmyk = None
+        self._mag_badge_approx = False
         self.scene.clear()
         self._detail_item = None
         self.pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(qimage))
@@ -233,49 +245,53 @@ class PageWidget(QGraphicsView):
             self._clear_magnifier_state()
             self.viewport().update()
 
-    def set_magnifier_renderer(self, renderer):
-        self._magnifier_renderer = renderer
+    def set_sampler_size(self, size):
+        try:
+            self._sampler_size = int(size)
+        except (TypeError, ValueError):
+            self._sampler_size = 1
+
+    def set_magnifier_hq(self, img, pos):
+        """Receive the asynchronously rendered high-quality magnifier image
+        for ``pos`` (a QPointF in scene coordinates) from the render worker."""
+        if img is None or img.isNull() or img.width() <= 0:
+            return
+        self._mag_hq_img = img
+        self._mag_hq_pos = pos
+        self.viewport().update()
 
     def _clear_magnifier_state(self):
         self._magnifier_active = False
         self._magnifier_pos = None
         self._mag_hq_img = None
         self._mag_hq_pos = None
-        self._mag_hq_pos_pending = None
-        if self._mag_hq_timer.isActive():
-            self._mag_hq_timer.stop()
+        self._mag_badge_cmyk = None
+        self._mag_badge_approx = False
+
+    def set_magnifier_cmyk(self, cmyk_0_100, approximate):
+        """Provide the CMYK badge values (4 floats, 0..100) for the current
+        magnifier position. Prefer the exact stored source color; set
+        ``approximate`` True when only a rendered value is available so the
+        badge can mark it as such."""
+        self._mag_badge_cmyk = cmyk_0_100
+        self._mag_badge_approx = bool(approximate)
 
     def request_hq_magnifier(self, scene_pos):
-        """Schedule a high-quality magnifier re-render (debounced).
+        """Request the high-quality magnifier image for the cursor position.
 
-        The heavy PDF re-render happens OFF the paint path so continuous
-        right-drag never blocks the UI thread (which would freeze it).
+        The actual render happens asynchronously on the background render
+        worker (the same thread that renders the page itself), so it uses the
+        exact same color pipeline (raw CMYK -> overprint/separation -> ICC->RGB)
+        and never blocks or crashes the GUI thread. Results arrive via
+        ``set_magnifier_hq``.
         """
-        if self._magnifier_renderer is None or scene_pos is None:
+        if self._render_zoom >= MAGNIFIER_HIDE_ZOOM:
             return
-        self._mag_hq_pos_pending = scene_pos
-        self._mag_hq_timer.start(40)
-
-    def _render_hq_magnifier(self):
-        if self._magnifier_renderer is None or not self._magnifier_active:
-            self._mag_hq_img = None
+        if scene_pos is None or not self._magnifier_active:
             return
-        pos = getattr(self, '_mag_hq_pos_pending', None)
-        if pos is None:
+        if self._source_qimage is None or self._page is None or self._render_zoom <= 0:
             return
-        try:
-            img = self._magnifier_renderer(pos.x(), pos.y())
-            if img is not None and not img.isNull() and img.width() > 0:
-                self._mag_hq_img = img
-                self._mag_hq_pos = pos
-            else:
-                self._mag_hq_img = None
-        except Exception:
-            self._mag_hq_img = None
-        # Repaint only the magnifier region, not the whole viewport.
-        vpos = self.mapFromScene(pos)
-        cx, cy = int(vpos.x()), int(vpos.y())
-        self.viewport().update(cx - 140, cy - 160, 280, 340)
+        self.magnifier_requested.emit(scene_pos.x(), scene_pos.y())
 
     def drawForeground(self, painter, rect):
         if self._overview_active:
@@ -575,7 +591,8 @@ class PageWidget(QGraphicsView):
     def _draw_magnifier(self, painter):
         if (not self._magnifier_allowed or not self._magnifier_active
                 or self._magnifier_pos is None
-                or not self._source_qimage):
+                or not self._source_qimage
+                or self._render_zoom >= MAGNIFIER_HIDE_ZOOM):
             return
 
         view_pos = self.mapFromScene(self._magnifier_pos)
@@ -588,22 +605,32 @@ class PageWidget(QGraphicsView):
         pos = self._magnifier_pos
         scene_x_f = pos.x()
         scene_y_f = pos.y()
+        si = int(round(scene_x_f))
+        sj = int(round(scene_y_f))
 
         qimage = self._source_qimage
         if (scene_x_f < 0 or scene_x_f >= qimage.width()
                 or scene_y_f < 0 or scene_y_f >= qimage.height()):
             return
 
-        # Use the cached high-quality re-render (built off the paint path via
-        # a debounced timer) when its position matches; otherwise fall back to
-        # fast QImage sampling. Never render synchronously inside paint — that
-        # would block the UI thread and freeze the app on right-drag.
+        # Use the cached high-quality re-render (built off the paint path on the
+        # background worker) whenever the cursor is still inside the region it
+        # covers. The HQ render lags the cursor by one worker pass, so we must
+        # NOT require an exact position match (that would flicker the sharp
+        # image against the pixelated fallback on every move). Instead we draw
+        # the HQ image at its true position so the content stays aligned to the
+        # cursor as it pans. Only fall back to the pixelated screen sampling
+        # when no HQ is available yet or the cursor left the rendered region
+        # (fast flick). Never render synchronously inside paint — that would
+        # block the UI thread and freeze the app on right-drag.
         magnifier_img = None
+        hq_cx, hq_cy = cx, cy
         if (self._mag_hq_img is not None
-                and self._mag_hq_pos is not None
-                and abs(self._mag_hq_pos.x() - scene_x_f) < 1.0
-                and abs(self._mag_hq_pos.y() - scene_y_f) < 1.0):
-            magnifier_img = self._mag_hq_img
+                and self._mag_hq_pos is not None):
+            hq_view = self.mapFromScene(self._mag_hq_pos)
+            if math.hypot(hq_view.x() - cx, hq_view.y() - cy) < radius * 0.98:
+                magnifier_img = self._mag_hq_img
+                hq_cx, hq_cy = hq_view.x(), hq_view.y()
 
         painter.save()
         painter.setWorldTransform(QTransform())
@@ -617,115 +644,149 @@ class PageWidget(QGraphicsView):
         painter.setBrush(self._magnifier_bg)
         painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
+        # Base layer: pixelated screen sampling, always aligned to the cursor
+        # and filling the circle. It is the direct view when no HQ is ready and
+        # acts as a gap-filler underneath the (panned) HQ image.
+        src_half = math.ceil(radius / mag_zoom)
+        x1 = max(0, si - src_half)
+        y1 = max(0, sj - src_half)
+        x2 = min(qimage.width(), si + src_half + 1)
+        y2 = min(qimage.height(), sj + src_half + 1)
+        src_width = x2 - x1
+        src_height = y2 - y1
+        if src_width > 0 and src_height > 0:
+            fb_dst_x = cx - (si - x1) * mag_zoom
+            fb_dst_y = cy - (sj - y1) * mag_zoom
+            fb_dst_w = src_width * mag_zoom
+            fb_dst_h = src_height * mag_zoom
+            painter.drawImage(
+                QRectF(fb_dst_x, fb_dst_y, fb_dst_w, fb_dst_h),
+                qimage, QRectF(x1, y1, src_width, src_height))
+
         if magnifier_img is not None:
-            # High-quality PDF re-render: scale to fit magnifier circle
+            # High-quality PDF re-render overlaid, drawn at its true position so
+            # the content tracks the cursor as it pans (no flicker against the
+            # pixelated base layer).
             src_w = magnifier_img.width()
             src_h = magnifier_img.height()
             if src_w > 0 and src_h > 0:
                 scale = (radius * 2) / max(src_w, src_h)
                 dst_w = int(src_w * scale)
                 dst_h = int(src_h * scale)
-                dst_x = cx - dst_w // 2
-                dst_y = cy - dst_h // 2
-                target_rect = QRectF(dst_x, dst_y, dst_w, dst_h)
-                source_rect = QRectF(0, 0, src_w, src_h)
-                painter.drawImage(target_rect, magnifier_img, source_rect)
+                dst_x = int(hq_cx - dst_w // 2)
+                dst_y = int(hq_cy - dst_h // 2)
+                painter.drawImage(
+                    QRectF(dst_x, dst_y, dst_w, dst_h),
+                    magnifier_img, QRectF(0, 0, src_w, src_h))
 
-                # Highlight center pixel — mark the exact sampled point
+                # Highlight the exact sampled point (the cursor). Maximum-contrast
+                # mark: a black border (visible on light/white areas) around a
+                # white square (visible on dark areas), so it reads on any color.
                 center_mark = max(3, int(4 * scale))
-                painter.setPen(QPen(QColor(255, 255, 255), 1.5))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(QRectF(cx - center_mark / 2, cy - center_mark / 2,
+                border = max(2, int(center_mark * 0.4))
+                outer = center_mark + border * 2
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(0, 0, 0))
+                painter.drawRect(QRectF(cx - outer / 2,
+                                        cy - outer / 2,
+                                        outer, outer))
+                painter.setBrush(QColor(255, 255, 255))
+                painter.drawRect(QRectF(cx - center_mark / 2,
+                                        cy - center_mark / 2,
                                         center_mark, center_mark))
-        else:
-            # Fallback: sample from the pre-rendered QImage
-            si = int(round(scene_x_f))
-            sj = int(round(scene_y_f))
-            src_half = math.ceil(radius / mag_zoom)
-            x1 = max(0, si - src_half)
-            y1 = max(0, sj - src_half)
-            x2 = min(qimage.width(), si + src_half + 1)
-            y2 = min(qimage.height(), sj + src_half + 1)
-            src_width = x2 - x1
-            src_height = y2 - y1
-            if src_width <= 0 or src_height <= 0:
-                painter.restore()
-                return
-
-            dst_x = cx - (si - x1) * mag_zoom
-            dst_y = cy - (sj - y1) * mag_zoom
-            dst_w = src_width * mag_zoom
-            dst_h = src_height * mag_zoom
-            target_rect = QRectF(dst_x, dst_y, dst_w, dst_h)
-            source_rect = QRectF(x1, y1, src_width, src_height)
-            painter.drawImage(target_rect, qimage, source_rect)
-
-            # Pixel grid overlay
+        elif src_width > 0 and src_height > 0:
+            # No HQ available: pixel grid + center highlight on the fallback.
             pen_grid = QPen(QColor(255, 255, 255, 40), 0.5)
             painter.setPen(pen_grid)
             for i in range(src_width + 1):
-                gx = dst_x + i * mag_zoom
-                painter.drawLine(QPointF(gx, dst_y), QPointF(gx, dst_y + dst_h))
+                gx = fb_dst_x + i * mag_zoom
+                painter.drawLine(QPointF(gx, fb_dst_y),
+                                QPointF(gx, fb_dst_y + fb_dst_h))
             for j in range(src_height + 1):
-                gy = dst_y + j * mag_zoom
-                painter.drawLine(QPointF(dst_x, gy), QPointF(dst_x + dst_w, gy))
-
-            # Center pixel highlight
-            px_x = dst_x + (si - x1) * mag_zoom
-            px_y = dst_y + (sj - y1) * mag_zoom
-            painter.setPen(QPen(QColor(255, 255, 255), 1.5))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
+                gy = fb_dst_y + j * mag_zoom
+                painter.drawLine(QPointF(fb_dst_x, gy),
+                                QPointF(fb_dst_x + fb_dst_w, gy))
+            px_x = fb_dst_x + (si - x1) * mag_zoom
+            px_y = fb_dst_y + (sj - y1) * mag_zoom
+            # Maximum-contrast center mark: black border + white fill square.
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0))
+            painter.drawRect(QRectF(px_x - 1, px_y - 1, mag_zoom + 2, mag_zoom + 2))
+            painter.setBrush(QColor(255, 255, 255))
             painter.drawRect(QRectF(px_x, px_y, mag_zoom, mag_zoom))
 
         painter.setClipping(False)
 
-        # Circle border
-        painter.setPen(QPen(QColor(255, 255, 255, 200), 2))
+        # Outline ring: a contrasting dark outer stroke (visible on light page
+        # areas) followed by a bright inner stroke (visible on dark page areas),
+        # so the magnifier edge is always clearly delineated.
         painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(0, 0, 0, 180), 3))
+        painter.drawEllipse(QPointF(cx, cy), radius + 1, radius + 1)
+        painter.setPen(QPen(QColor(255, 255, 255, 220), 2))
         painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
-        # CMYK values next to the magnifier
-        if self._source_cmyk is not None:
+        # CMYK values next to the magnifier. Use the resolved badge values
+        # (exact stored source color when available; rendered fallback marked
+        # as approximate) supplied by the main window. Fall back to sampling
+        # the rendered CMYK buffer only if no resolved value is available yet.
+        badge = self._mag_badge_cmyk
+        if badge is None and self._source_cmyk is not None:
             h, w = self._source_cmyk.shape[:2]
-            if 0 <= scene_y < h and 0 <= scene_x < w:
-                cmyk = self._source_cmyk[scene_y, scene_x]
-                c, m, y, k = (int(cmyk[0]), int(cmyk[1]),
-                              int(cmyk[2]), int(cmyk[3]))
+            if 0 <= sj < h and 0 <= si < w:
+                size = self._sampler_size
+                if size > 1:
+                    half = int(round((size / 2.0) * self._render_zoom))
+                    y0 = max(0, sj - half)
+                    y1 = min(h, sj + half + 1)
+                    x0 = max(0, si - half)
+                    x1 = min(w, si + half + 1)
+                    cmyk = self._source_cmyk[y0:y1, x0:x1].mean(axis=(0, 1))
+                else:
+                    cmyk = self._source_cmyk[sj, si]
+                badge = (cmyk[0] / 2.55, cmyk[1] / 2.55,
+                         cmyk[2] / 2.55, cmyk[3] / 2.55)
+                self._mag_badge_approx = True
 
-                label_font = QFont("monospace", 9)
-                painter.setFont(label_font)
+        if badge is not None:
+            c, m, y, k = (badge[0], badge[1], badge[2], badge[3])
 
-                lines = [
-                    f"C  {c / 2.55:.0f}%",
-                    f"M  {m / 2.55:.0f}%",
-                    f"Y  {y / 2.55:.0f}%",
-                    f"K  {k / 2.55:.0f}%",
-                ]
+            label_font = QFont("monospace", 9)
+            painter.setFont(label_font)
 
-                text_x = cx + radius + 16
-                text_y = cy - 28
-                fm = painter.fontMetrics()
-                lh = fm.height() + 2
-                bg_w = 0
-                for line in lines:
-                    bg_w = max(bg_w, fm.horizontalAdvance(line))
-                bg_w += 16
-                bg_h = lh * len(lines) + 8
-                if text_x + bg_w > self.viewport().width():
-                    text_x = cx - radius - bg_w - 16
-                if text_y + bg_h > self.viewport().height():
-                    text_y = self.viewport().height() - bg_h - 4
-                if text_y < 0:
-                    text_y = 4
+            lines = [
+                f"C  {c:.0f}%",
+                f"M  {m:.0f}%",
+                f"Y  {y:.0f}%",
+                f"K  {k:.0f}%",
+            ]
+            if self._mag_badge_approx:
+                lines.append("≈ approx")
 
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(self._badge_bg)
-                painter.drawRoundedRect(QRectF(text_x, text_y, bg_w, bg_h), 4, 4)
+            text_x = cx + radius + 16
+            text_y = cy - 28
+            fm = painter.fontMetrics()
+            lh = fm.height() + 2
+            bg_w = 0
+            for line in lines:
+                bg_w = max(bg_w, fm.horizontalAdvance(line))
+            bg_w += 16
+            bg_h = lh * len(lines) + 8
+            if text_x + bg_w > self.viewport().width():
+                text_x = cx - radius - bg_w - 16
+            if text_y + bg_h > self.viewport().height():
+                text_y = self.viewport().height() - bg_h - 4
+            if text_y < 0:
+                text_y = 4
 
-                painter.setPen(self._badge_text)
-                for i, line in enumerate(lines):
-                    painter.drawText(QPointF(text_x + 8, text_y + lh * (i + 1) - 2),
-                                     line)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._badge_bg)
+            painter.drawRoundedRect(QRectF(text_x, text_y, bg_w, bg_h), 4, 4)
+
+            painter.setPen(self._badge_text)
+            for i, line in enumerate(lines):
+                painter.drawText(QPointF(text_x + 8, text_y + lh * (i + 1) - 2),
+                                 line)
 
         painter.restore()
 
@@ -752,13 +813,15 @@ class PageWidget(QGraphicsView):
             scene_pos = self.mapToScene(event.pos())
             if (self.pixmap_item is not None
                     and self.pixmap_item.boundingRect().contains(scene_pos)):
-                self._magnifier_active = True
-                self._magnifier_pos = scene_pos
-                self.hide_color_tooltip()
-                self.request_hq_magnifier(scene_pos)
-                vpos = self.mapFromScene(scene_pos)
-                cx, cy = int(vpos.x()), int(vpos.y())
-                self.viewport().update(cx - 140, cy - 160, 280, 340)
+                if self._render_zoom < MAGNIFIER_HIDE_ZOOM:
+                    self._magnifier_active = True
+                    self._magnifier_pos = scene_pos
+                    self.hide_color_tooltip()
+                    self.request_hq_magnifier(scene_pos)
+                    # Resolve the CMYK badge (exact stored source) for this position.
+                    self.mouse_moved.emit(scene_pos)
+                    self.viewport().update()
+                # else: page already zoomed in past the threshold -> no magnifier
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -792,12 +855,10 @@ class PageWidget(QGraphicsView):
                     self._mag_last_update = now
                     self.request_hq_magnifier(scene_pos)
                     self.mouse_moved.emit(scene_pos)
-                    # Repaint only the magnifier region (not the whole viewport)
-                    # so the expensive full-scene overlay redraw is avoided.
-                    vp = self.viewport()
-                    vpos = self.mapFromScene(scene_pos)
-                    cx, cy = int(vpos.x()), int(vpos.y())
-                    vp.update(cx - 140, cy - 160, 280, 340)
+                    # Repaint the whole viewport: the CMYK badge drawn beside
+                    # the magnifier circle (and that may clamp to a screen edge)
+                    # is not covered by a small region, leaving smeared remnants.
+                    self.viewport().update()
         else:
             if on_page:
                 self.mouse_moved.emit(scene_pos)

@@ -4,6 +4,7 @@ import re
 import threading
 import queue
 import time
+import fitz
 from collections import OrderedDict
 import numpy as np
 
@@ -15,7 +16,7 @@ from PyQt6.QtWidgets import (
     QLabel, QSpinBox, QCheckBox, QGroupBox, QGridLayout,
     QFileDialog, QApplication, QScrollArea, QMessageBox,
     QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
-    QFormLayout, QComboBox, QToolButton,
+    QFormLayout, QComboBox, QToolButton, QProgressBar,
     QAbstractScrollArea, QMenu, QRadioButton,
     QKeySequenceEdit, QSlider, QStyle
 )
@@ -129,6 +130,7 @@ class SettingsDialog(QDialog):
     box_unit_changed = pyqtSignal(str)
     magnifier_changed = pyqtSignal(bool)
     dbl_click_zoom_changed = pyqtSignal(int)
+    sampler_size_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -252,6 +254,23 @@ class SettingsDialog(QDialog):
         magnifier_row.addWidget(self.magnifier_cb)
         magnifier_row.addStretch()
         form.addRow(magnifier_row)
+
+        # Color sampler area
+        self.sampler_combo = QComboBox()
+        for s in (1, 3, 5, 11):
+            self.sampler_combo.addItem(f"{s}x{s}", s)
+        cur_size = int(self._settings.value("ui/sampler_size", 1))
+        idx = self.sampler_combo.findData(cur_size)
+        if idx >= 0:
+            self.sampler_combo.setCurrentIndex(idx)
+        sampler_size_row = QHBoxLayout()
+        sampler_size_row.addWidget(QLabel("Color sampler area"))
+        sampler_size_row.addWidget(self.sampler_combo)
+        sampler_size_row.addStretch()
+        sampler_size_row.addWidget(QLabel("PDF points (averaged)"))
+        form.addRow(sampler_size_row)
+        self.sampler_combo.currentIndexChanged.connect(
+            self._on_sampler_size_changed)
 
         # Reopen last document on startup
         self.reopen_cb = QCheckBox("Reopen last document on startup")
@@ -447,6 +466,11 @@ class SettingsDialog(QDialog):
     def _on_dbl_zoom_changed(self, value):
         self._settings.setValue("ui/dbl_click_zoom", value)
         self.dbl_click_zoom_changed.emit(value)
+
+    def _on_sampler_size_changed(self, index):
+        size = self.sampler_combo.itemData(index)
+        self._settings.setValue("ui/sampler_size", size)
+        self.sampler_size_changed.emit(size)
 
     def _save(self):
         mode = "hide" if self.shift_hide.isChecked() else "show"
@@ -698,9 +722,9 @@ class FitzThumbWorker(QObject):
     tac_ready = pyqtSignal(int, object)
     page_draft_ready = pyqtSignal(object, object, float, object, int)
     page_done_ready = pyqtSignal(object, object, float, bool, object, object, float, int, object)
-    mag_cache_ready = pyqtSignal(object, object)
     prefetch_done = pyqtSignal(object, object)
     detail_ready = pyqtSignal(object, object, float, int)
+    magnifier_ready = pyqtSignal(object, float, float)
 
     def __init__(self):
         super().__init__()
@@ -796,12 +820,12 @@ class FitzThumbWorker(QObject):
                     self.tac_ready.emit(page_index, tac)
             elif kind == 'page':
                 self._process_page(item)
-            elif kind == 'mag':
-                self._process_mag(item)
             elif kind == 'prefetch':
                 self._process_prefetch(item)
             elif kind == 'detail':
                 self._process_detail(item)
+            elif kind == 'magnifier':
+                self._process_magnifier(item)
 
     def _process_page(self, item):
         import fitz
@@ -889,29 +913,6 @@ class FitzThumbWorker(QObject):
         except Exception:
             import traceback
             traceback.print_exc()
-
-    def _process_mag(self, item):
-        import fitz
-        import numpy as np
-        from viewer.render_engine import _no_icc
-
-        _, path, page_num, cancel_event = item
-        if cancel_event.is_set() or self._cancel.is_set():
-            return
-        doc = self._get_doc(path)
-        try:
-            page = doc[page_num]
-            mat = fitz.Matrix(4.0, 4.0)
-            with _no_icc():
-                pix = page.get_pixmap(matrix=mat, colorspace=fitz.csCMYK)
-            if pix.width == 0 or pix.height == 0:
-                return
-            cmyk_arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                pix.height, pix.width, 4).copy()
-            cache_key = (page_num, id(path))
-            self.mag_cache_ready.emit(cache_key, cmyk_arr)
-        except Exception:
-            pass
 
     def _process_prefetch(self, item):
         import fitz
@@ -1025,6 +1026,39 @@ class FitzThumbWorker(QObject):
         except Exception:
             pass
 
+    def _process_magnifier(self, item):
+        import fitz
+
+        (_, path, page_num, zoom, clip, mode, channels, icc_path,
+         sim_profile, simulate_overprint, cancel_event,
+         scene_x, scene_y) = item
+
+        if cancel_event.is_set() or self._cancel.is_set():
+            return
+        doc = self._get_doc(path)
+        try:
+            clip_rect = fitz.Rect(*clip)
+            rgb_arr, _, _, _, _, _ = render_one_data(
+                doc, page_num, zoom, mode, channels, icc_path,
+                sim_profile, simulate_overprint, clip=clip_rect)
+            if cancel_event.is_set() or self._cancel.is_set():
+                return
+            if rgb_arr is None or rgb_arr.size == 0:
+                return
+            h, w = rgb_arr.shape[:2]
+            qimg = QImage(rgb_arr.data, w, h, w * 3,
+                          QImage.Format.Format_RGB888).copy()
+            self.magnifier_ready.emit(qimg, scene_x, scene_y)
+        except Exception:
+            pass
+
+    def submit_magnifier(self, path, page_num, zoom, clip, mode, channels,
+                         icc_path, sim_profile, simulate_overprint,
+                         cancel_event, scene_x, scene_y):
+        self._queue.put(('magnifier', path, page_num, zoom, clip, mode,
+                         channels, icc_path, sim_profile, simulate_overprint,
+                         cancel_event, scene_x, scene_y))
+
     def submit_detail(self, path, page_num, zoom, clip, mode, channels,
                       icc_path, sim_profile, simulate_overprint,
                       cancel_event, seq, object_filter=None):
@@ -1048,9 +1082,6 @@ class FitzThumbWorker(QObject):
                           icc_path, sim_profile, spread, is_offset_single,
                           simulate_overprint, box_mask, cancel_event, seq,
                           draft_seq, cache_key, object_filter))
-
-    def submit_mag(self, path, page_num, cancel_event):
-        self._queue.put(('mag', path, page_num, cancel_event))
 
     def submit_prefetch(self, path, page_num, zoom, mode, channels,
                          icc_path, sim_profile, spread, is_offset_single,
@@ -1081,6 +1112,92 @@ class FitzThumbWorker(QObject):
                 pass
             self._doc = None
             self._doc_path = None
+
+
+class LoadingOverlay(QWidget):
+    """Centered, non-blocking loading indicator with a percentage progress bar."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("LoadingOverlay")
+        self.setFixedSize(380, 132)
+        self._build_ui()
+        self._accent = '#1de9b6'
+        self._is_light = False
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 18)
+        layout.setSpacing(12)
+
+        self._title = QLabel("Loading PDF…")
+        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title.setStyleSheet("font-size: 11pt; font-weight: bold;")
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(16)
+
+        self._pct = QLabel("0%")
+        self._pct.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pct.setStyleSheet("font-size: 10pt;")
+
+        layout.addWidget(self._title)
+        layout.addWidget(self._bar)
+        layout.addWidget(self._pct)
+
+        self.setStyleSheet("""
+            LoadingOverlay {
+                background: #2b2b2b;
+                border: 1px solid rgba(128,128,128,0.35);
+                border-radius: 10px;
+            }
+        """)
+        self._bar.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                border-radius: 8px;
+                background: rgba(128,128,128,0.25);
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                border-radius: 8px;
+                background: #1de9b6;
+            }
+        """)
+
+    def apply_theme(self, is_light, accent):
+        self._accent = accent
+        self._is_light = is_light
+        bg = '#e8e8e8' if is_light else '#2b2b2b'
+        border = 'rgba(80,80,80,0.35)' if is_light else 'rgba(128,128,128,0.35)'
+        fg = '#222' if is_light else '#e0e0e0'
+        self.setStyleSheet(
+            f"LoadingOverlay {{ background: {bg}; border: 1px solid {border}; "
+            f"border-radius: 10px; }}")
+        self._title.setStyleSheet(
+            f"font-size: 11pt; font-weight: bold; color: {fg};")
+        self._pct.setStyleSheet(f"font-size: 10pt; color: {fg};")
+        self._bar.setStyleSheet(
+            f"QProgressBar {{ border: none; border-radius: 8px; "
+            f"background: rgba(128,128,128,0.25); text-align: center; }}"
+            f"QProgressBar::chunk {{ border-radius: 8px; background: {accent}; }}")
+
+    def set_progress(self, value):
+        value = max(0, min(100, int(value)))
+        self._bar.setValue(value)
+        self._pct.setText(f"{value}%")
+
+    def center_on_parent(self):
+        p = self.parentWidget()
+        if p is None:
+            return
+        pr = p.rect()
+        x = (pr.width() - self.width()) // 2
+        y = (pr.height() - self.height()) // 2
+        self.move(x, y)
 
 
 class PreflightWindow(QMainWindow):
@@ -1159,9 +1276,32 @@ class PreflightWindow(QMainWindow):
         self._thumb_worker.tac_ready.connect(self._on_tac_ready)
         self._thumb_worker.page_done_ready.connect(self._on_page_done_ready)
         self._thumb_worker.page_draft_ready.connect(self._on_page_draft_done)
-        self._thumb_worker.mag_cache_ready.connect(self._on_mag_cache_ready)
         self._thumb_worker.prefetch_done.connect(self._on_prefetch_done)
         self._thumb_worker.detail_ready.connect(self._on_detail_ready)
+        self._thumb_worker.magnifier_ready.connect(self._on_magnifier_ready)
+
+        # Asynchronous high-quality magnifier rendering (debounced, rate-limited
+        # to the worker's throughput so the queue never backs up).
+        self._mag_pending = None
+        self._mag_last_submitted = None
+        self._mag_in_flight = False
+        self._mag_cancel_event = None
+        self._mag_req_connected = False
+        self._mag_tick_timer = QTimer(self)
+        self._mag_tick_timer.setInterval(20)
+        self._mag_tick_timer.timeout.connect(self._mag_tick)
+        self._mag_tick_timer.start()
+
+        # ---- Loading overlay (centered percentage progress) ----
+        self._load_overlay = LoadingOverlay(self)
+        self._load_overlay.hide()
+        self._loading = False
+        self._load_target = 0
+        self._load_value = 0
+        self._load_anim = QTimer(self)
+        self._load_anim.setInterval(20)
+        self._load_anim.timeout.connect(self._tick_load_anim)
+
         self._setup_shortcuts()
         self._connect_signals()
         mode = str(self._settings.value("ui/theme_mode", "dark"))
@@ -1175,6 +1315,39 @@ class PreflightWindow(QMainWindow):
         if isinstance(raw, str):
             raw = [raw]
         return list(raw)[:20] if raw else []
+
+    def _start_loading(self, title="Loading PDF…"):
+        self._loading = True
+        self._load_value = 0
+        self._load_target = 0
+        self._load_overlay._title.setText(title)
+        self._load_overlay.set_progress(0)
+        self._load_overlay.center_on_parent()
+        self._load_overlay.raise_()
+        self._load_overlay.show()
+        self._load_anim.start()
+
+    def _set_load_progress(self, value):
+        self._load_target = max(self._load_target, int(value))
+
+    def _tick_load_anim(self):
+        if self._load_value < self._load_target:
+            step = max(1, (self._load_target - self._load_value) // 8)
+            self._load_value = min(self._load_target, self._load_value + step)
+            self._load_overlay.set_progress(self._load_value)
+        elif not self._loading:
+            self._load_anim.stop()
+
+    def _finish_loading(self):
+        self._loading = False
+        self._load_target = 100
+        self._load_value = 100
+        self._load_overlay.set_progress(100)
+        self._load_anim.stop()
+        QTimer.singleShot(250, self._hide_load_overlay)
+
+    def _hide_load_overlay(self):
+        self._load_overlay.hide()
 
     def _maybe_reopen_last(self):
         if str(self._settings.value("ui/reopen_last", "false")).lower() != "true":
@@ -1253,6 +1426,16 @@ class PreflightWindow(QMainWindow):
         self.render.close()
         _close_render_doc_cache()
 
+    def resizeEvent(self, event):
+        if hasattr(self, '_load_overlay') and self._load_overlay.isVisible():
+            self._load_overlay.center_on_parent()
+        super().resizeEvent(event)
+
+    def moveEvent(self, event):
+        if hasattr(self, '_load_overlay') and self._load_overlay.isVisible():
+            self._load_overlay.center_on_parent()
+        super().moveEvent(event)
+
     def _rebuild_recent_menu(self):
         self._recent_menu.clear()
         self._recent_menu.setMinimumWidth(280)
@@ -1314,6 +1497,8 @@ class PreflightWindow(QMainWindow):
         self._reload_icons()
         if hasattr(self, 'page_widget') and self.page_widget:
             self.page_widget._apply_theme_colors(is_light)
+        if hasattr(self, '_load_overlay') and self._load_overlay:
+            self._load_overlay.apply_theme(is_light, self._accent_color)
         self._update_sidebar_colors(is_light)
         self._update_accent_styles()
         self._update_of_styles()
@@ -1360,12 +1545,7 @@ class PreflightWindow(QMainWindow):
                 f"color: {accent}; }}")
         for btn in [self.chk_c, self.chk_m, self.chk_y, self.chk_k]:
             color, _ = self._sep_btn_style.get(btn._sep_key, ("#888", "#888"))
-            new_styles = (
-                f"QPushButton {{ border: 1px solid {muted}; border-left: 3px solid {color}; "
-                f"text-align: center; padding: 4px 8px; color: {muted}; font-weight: normal; font-size: 9pt; }}"
-                f"QPushButton:hover {{ border-left: 4px solid {color}; background: rgba(128,128,128,0.15); }}"
-                f"QPushButton:checked {{ border-left: 4px solid {color}; }}")
-            btn.setStyleSheet(new_styles)
+            btn.setStyleSheet(self._sep_btn_stylesheet(color, muted, btn.isChecked()))
         if hasattr(self, '_btn_curves'):
             self._btn_curves.setStyleSheet(
                 f"QPushButton {{ border: 1px solid {accent}; color: {muted}; "
@@ -1687,6 +1867,8 @@ class PreflightWindow(QMainWindow):
             return
         if self._render_cancel.is_set() or seq != self._render_seq:
             return
+        if self._loading:
+            self._finish_loading()
         pg2 = boxes.pop('_page2', None)
         pg2_info = None
         if pg2 is not None:
@@ -1710,7 +1892,6 @@ class PreflightWindow(QMainWindow):
             entry['pg2_info'] = pg2_info
         if cache_key is not None:
             self._cache_put(cache_key, entry)
-        self._schedule_magnifier_cache_build()
         self._schedule_page_prefetch()
 
     def _on_page_draft_done(self, rgb_arr, boxes, zoom, page_rect, seq):
@@ -1718,6 +1899,8 @@ class PreflightWindow(QMainWindow):
             return
         if self._render_cancel.is_set() or seq != self._draft_seq:
             return
+        if self._loading:
+            self._set_load_progress(80)
         boxes = boxes.copy()
         pg2 = boxes.pop('_page2', None)
         pg2_info = None
@@ -1730,10 +1913,6 @@ class PreflightWindow(QMainWindow):
             }
         self._display_render_result(rgb_arr, None, boxes, zoom,
                                       False, page_rect, pg2_info)
-
-    def _on_mag_cache_ready(self, cache_key, cmyk_arr):
-        self.render._mag_cache = cmyk_arr
-        self.render._mag_cache_key = cache_key
 
     def _on_prefetch_done(self, cache_key, entry):
         if self._current_path and self.render.doc:
@@ -1774,17 +1953,6 @@ class PreflightWindow(QMainWindow):
             path, render_page, zoom, mode, channels, icc_path, sim_profile,
             spread, is_offset_single, simulate_op, self._active_box_mask,
             cache_key, object_filter)
-
-    def _start_magnifier_cache_build(self):
-        """Build magnifier cache on the worker thread so it's ready on right-click."""
-        if not self._current_path:
-            return
-        enabled = str(self._settings.value(
-            "ui/magnifier_enabled", "true")).lower() == "true"
-        if not enabled:
-            return
-        self._thumb_worker.submit_mag(
-            self._current_path, self._current_page, self._mag_cancel)
 
     def _format_box(self, box):
         """Format box dimensions per settings: mm/pt/both"""
@@ -1862,6 +2030,7 @@ class PreflightWindow(QMainWindow):
 
     def _build_ui(self):
         self.page_widget = PageWidget()
+        self.page_widget.set_sampler_size(self._sampler_size())
         self.page_widget.viewport().setAcceptDrops(True)
         self.page_widget.viewport().installEventFilter(self)
         self.setCentralWidget(self.page_widget)
@@ -2155,6 +2324,7 @@ class PreflightWindow(QMainWindow):
                 f"color: {self._muted_color}; background: transparent; }}")
             btn.setFixedHeight(28)
             sep_hl.addWidget(btn, 1)  # stretch factor 1 — fill space equally
+        self._refresh_sep_btn_styles()
         sv.addLayout(sep_hl)
         self._spot_container = QWidget()
         self._spot_layout = QHBoxLayout(self._spot_container)
@@ -2290,10 +2460,10 @@ class PreflightWindow(QMainWindow):
         self._btn_curves = QPushButton("Convert to curves")
         self._btn_curves.clicked.connect(self._fonts_to_curves)
         self._btn_curves.setStyleSheet(
-            f"QPushButton {{ border: 1px solid {self._accent_color}; color: {self._muted_color}; "
+            f"QPushButton {{ border: 1px solid {self._accent_color}; color: white; "
             f"border-radius: 4px; padding: 6px 16px; font-weight: normal; font-size: 9pt; }}"
-            f"QPushButton:hover {{ border: 1px solid {self._accent_color}; color: {self._accent_color}; }}"
-            f"QPushButton:pressed {{ border: 1px solid {self._accent_color}; color: {self._accent_color}; }}")
+            f"QPushButton:hover {{ border: 1px solid {self._accent_color}; color: white; }}"
+            f"QPushButton:pressed {{ border: 1px solid {self._accent_color}; color: white; }}")
         hl.addWidget(self._btn_curves)
         fv.addLayout(hl)
         blk.set_content(fw)
@@ -2362,6 +2532,8 @@ class PreflightWindow(QMainWindow):
         self.page_widget.clicked.connect(self._on_click)
         self.page_widget.empty_clicked.connect(self._open_file)
         self.page_widget.mouse_moved.connect(self._on_mouse_move)
+        self.page_widget.magnifier_requested.connect(
+            self._request_magnifier_render)
         self.page_widget.zoom_changed.connect(self._on_wheel)
         self.page_widget.double_clicked.connect(self._zoom_fit)
         self.page_widget.page_nav.connect(self._on_page_nav)
@@ -2378,7 +2550,6 @@ class PreflightWindow(QMainWindow):
         self.chk_y.toggled.connect(self._on_sep_changed)
         self.chk_k.toggled.connect(self._on_sep_changed)
 
-        self.page_widget.set_magnifier_renderer(self._render_magnifier_region)
         self._apply_magnifier_setting()
 
     def _apply_magnifier_setting(self, enabled=None):
@@ -2389,8 +2560,24 @@ class PreflightWindow(QMainWindow):
         if not enabled:
             if self._magnifier_cache_timer is not None:
                 self._magnifier_cache_timer.stop()
-            self.render._mag_cache = None
-            self.render._mag_cache_key = None
+
+    def _sampler_size(self):
+        try:
+            return int(self._settings.value("ui/sampler_size", 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _apply_sampler_size(self, size=None):
+        if size is None:
+            size = self._sampler_size()
+        self._settings.setValue("ui/sampler_size", size)
+        if hasattr(self, "page_widget"):
+            self.page_widget.set_sampler_size(size)
+        # Refresh the live readout immediately if the pointer is over the page.
+        if hasattr(self, "page_widget") and self.page_widget is not None:
+            pos = self.page_widget.mapFromGlobal(QCursor.pos())
+            if self.page_widget.rect().contains(pos):
+                self._on_mouse_move(self.page_widget.mapToScene(pos))
 
     def _show_settings(self):
         dlg = SettingsDialog(self)
@@ -2399,6 +2586,7 @@ class PreflightWindow(QMainWindow):
         dlg.dock_side_changed.connect(self._reposition_dock)
         dlg.box_unit_changed.connect(self._update_info)
         dlg.magnifier_changed.connect(self._apply_magnifier_setting)
+        dlg.sampler_size_changed.connect(self._apply_sampler_size)
         if dlg.exec():
             self._settings.sync()
 
@@ -2424,8 +2612,17 @@ class PreflightWindow(QMainWindow):
         h, w = self._cmyk_buf.shape[:2]
         sx = max(0, min(w - 1, sx))
         sy = max(0, min(h - 1, sy))
-        cmyk = self._cmyk_buf[sy, sx]
         rz = self._last_render_zoom if self._last_render_zoom > 0 else self._actual_zoom()
+        size = self._sampler_size()
+        if size > 1:
+            half = int(round((size / 2.0) * rz))
+            y0 = max(0, sy - half)
+            y1 = min(h, sy + half + 1)
+            x0 = max(0, sx - half)
+            x1 = min(w, sx + half + 1)
+            cmyk = self._cmyk_buf[y0:y1, x0:x1].mean(axis=(0, 1))
+        else:
+            cmyk = self._cmyk_buf[sy, sx]
         pdf_x = sx / rz
         pdf_y = (self.render.doc[self._current_page].rect.height
                  - sy / rz)
@@ -2440,7 +2637,8 @@ class PreflightWindow(QMainWindow):
         sy = int(round(scene_pos.y()))
         pdf_x = sx / rz
         pdf_y = page.rect.height - sy / rz
-        cmyk = self.render.sample_cmyk(self._current_page, pdf_x, pdf_y)
+        cmyk = self.render.sample_cmyk(self._current_page, pdf_x, pdf_y,
+                                       self._sampler_size())
         if cmyk is None:
             return None, None, None
         return cmyk, pdf_x, pdf_y
@@ -2561,21 +2759,90 @@ class PreflightWindow(QMainWindow):
 
 
 
-    def _render_magnifier_region(self, scene_x, scene_y):
-        if not self.render.doc:
-            return None
+    def _request_magnifier_render(self, scene_x, scene_y):
+        """Called (from the GUI thread) whenever the magnifier cursor moves.
+        Just records the latest position; the actual render is dispatched on a
+        timer so rapid moves are coalesced and the background worker is never
+        flooded."""
+        self._mag_pending = (scene_x, scene_y)
+
+    def _mag_tick(self):
+        if self._mag_pending is None or self._mag_in_flight:
+            return
+        if not self.render or not self.render.doc or self._current_page is None:
+            self._mag_pending = None
+            return
+        if not getattr(self.page_widget, '_magnifier_active', False):
+            self._mag_pending = None
+            return
+        if self._mag_pending == self._mag_last_submitted:
+            return
+
+        scene_x, scene_y = self._mag_pending
         rz = self._last_render_zoom if self._last_render_zoom > 0 else self._actual_zoom()
-        page = self.render.doc[self._current_page]
+        if rz <= 0:
+            return
+        capture_size_pt = 20.0
+        half = capture_size_pt / 2.0
+        # scene_x/scene_y are in rendered-pixmap pixels; convert to page points
+        # (fitz clip is y-down, so no flip here).
         pdf_x = scene_x / rz
-        pdf_y = page.rect.height - scene_y / rz
-        return self.render.render_magnifier_region(
-            self._current_page, pdf_x, pdf_y)
+        clip_y_down = scene_y / rz
+        clip_rect = fitz.Rect(pdf_x - half, clip_y_down - half,
+                              pdf_x + half, clip_y_down + half)
+
+        try:
+            dpr = max(1, int(self.page_widget.devicePixelRatio()))
+        except Exception:
+            dpr = 1
+        output_size_px = 200 * dpr
+        zoom = output_size_px / capture_size_pt
+
+        mode = self._mode
+        channels = {
+            'cyan': self.chk_c.isChecked(),
+            'magenta': self.chk_m.isChecked(),
+            'yellow': self.chk_y.isChecked(),
+            'black': self.chk_k.isChecked(),
+        }
+        icc_path = get_cmyk_icc_path(self.render.doc)
+        sim_profile = self.simulation.get_active_profile_path()
+        simulate_op = self.chk_simulate_overprint.isChecked()
+
+        if self._mag_cancel_event is not None:
+            self._mag_cancel_event.set()
+        cancel_event = threading.Event()
+        self._mag_cancel_event = cancel_event
+
+        self._mag_in_flight = True
+        self._mag_last_submitted = self._mag_pending
+        self._thumb_worker.submit_magnifier(
+            self._current_path, self._current_page, zoom, clip_rect, mode,
+            channels, icc_path, sim_profile, simulate_op, cancel_event,
+            scene_x, scene_y)
+
+    def _on_magnifier_ready(self, qimg, scene_x, scene_y):
+        self._mag_in_flight = False
+        if not getattr(self.page_widget, '_magnifier_active', False):
+            return
+        if qimg is None:
+            return
+        self.page_widget.set_magnifier_hq(qimg, QPointF(scene_x, scene_y))
 
     def _on_click(self, scene_pos):
         cmyk, px, py = self._get_cmyk_precise(scene_pos)
         if cmyk is not None:
             source_info = self.render.get_source_color_at(self._current_page, px, py)
-            self._update_cmyk_labels(cmyk, px, py, source_info=source_info)
+        self._update_cmyk_labels(cmyk, px, py, source_info=source_info)
+
+        # Keep the magnifier CMYK badge in sync with the same source-preferring
+        # logic (AGENTS.md: show the exact stored color; mark the rendered-only
+        # fallback as approximate). Hover and click must agree.
+        if self.page_widget.is_magnifier_active:
+            cc, cm_, cy_, ck_ = self._choose_cmyk_display(cmyk, source_info)
+            approx = not self._uses_source(cmyk, source_info)
+            self.page_widget.set_magnifier_cmyk((cc, cm_, cy_, ck_), approx)
+
         else:
             self._clear_cmyk_labels()
 
@@ -2922,7 +3189,7 @@ class PreflightWindow(QMainWindow):
                         pass
             fname_val.mousePressEvent = _open_folder
             fname_val.enterEvent = lambda e, lbl=fname_val: lbl.setStyleSheet(
-                f"color: {self._accent_color}; background: transparent; font-weight: bold; font-size: 9pt; text-decoration: underline;")
+                "color: #fff; background: rgba(128,128,128,0.25); font-weight: bold; font-size: 9pt; text-decoration: underline;")
             fname_val.leaveEvent = lambda e, lbl=fname_val: lbl.setStyleSheet(
                 "color: #fff; background: transparent; font-weight: bold; font-size: 9pt; text-decoration: underline;")
             self.cs_grid_layout.addWidget(fname_val, row, 1)
@@ -3085,21 +3352,6 @@ class PreflightWindow(QMainWindow):
             self._info_update_timer.timeout.connect(self._update_info)
         self._info_update_timer.start(delay_ms)
 
-    def _schedule_magnifier_cache_build(self):
-        if not self._current_path or not self.render.doc:
-            return
-        enabled = str(self._settings.value(
-            "ui/magnifier_enabled", "true")).lower() == "true"
-        if not enabled:
-            return
-        if self._magnifier_cache_timer is None:
-            self._magnifier_cache_timer = QTimer(self)
-            self._magnifier_cache_timer.setSingleShot(True)
-            self._magnifier_cache_timer.timeout.connect(
-                self._start_magnifier_cache_build)
-        self._mag_cancel.clear()
-        self._magnifier_cache_timer.start(800)
-
     def _cache_clear(self):
         with self._page_cache_lock:
             self._page_cache.clear()
@@ -3162,7 +3414,6 @@ class PreflightWindow(QMainWindow):
         elif self._last_render_zoom == 0:
             self.page_widget.centerOn(w / 2, h / 2)
         self._last_render_zoom = zoom
-        self._schedule_magnifier_cache_build()
         self._warm_caches()
         self._schedule_detail_render()
 
@@ -3293,9 +3544,12 @@ class PreflightWindow(QMainWindow):
         threading.Thread(target=_warm, daemon=True).start()
 
     def open_file(self, path):
+        self._start_loading()
         try:
             count = self.render.open(path)
+            self._set_load_progress(20)
             self.analyzer.open(path)
+            self._set_load_progress(35)
             self._current_path = os.path.abspath(path)
             self._current_page = 0
             self._overview_active = False
@@ -3328,9 +3582,11 @@ class PreflightWindow(QMainWindow):
                         break
             if not selected:
                 self.simulation.clear_simulation_profile()
+            self._set_load_progress(50)
             self._update_info()
             self._zoom_fit()
         except Exception as e:
+            self._finish_loading()
             QMessageBox.critical(self, "Error",
                                  f"Failed to open PDF:\n{e}")
 
@@ -3582,18 +3838,33 @@ class PreflightWindow(QMainWindow):
         else:
             self._start_bg_render()
 
+    def _sep_btn_stylesheet(self, color, muted, checked):
+        # Full stylesheet (including hover / disabled) so theme re-applies
+        # keep reflecting the actual checked state of each channel.
+        if checked:
+            return (
+                f"QPushButton {{ border: 1px solid {color}; border-left: 4px solid {color}; "
+                f"text-align: center; padding: 4px 8px; color: #fff; font-weight: normal; font-size: 9pt; }}"
+                f"QPushButton:hover {{ border: 1px solid {color}; border-left: 4px solid {color}; "
+                f"background: rgba(128,128,128,0.15); color: #fff; }}"
+                f"QPushButton:disabled {{ border: 1px solid {muted}; border-left: 3px solid {muted}; "
+                f"color: {muted}; background: transparent; }}")
+        return (
+            f"QPushButton {{ border: 1px solid {muted}; border-left: 3px solid {color}; "
+            f"text-align: center; padding: 4px 8px; color: {muted}; font-weight: normal; font-size: 9pt; }}"
+            f"QPushButton:hover {{ border-left: 4px solid {color}; background: rgba(128,128,128,0.15); }}"
+            f"QPushButton:disabled {{ border: 1px solid {muted}; border-left: 3px solid {muted}; "
+            f"color: {muted}; background: transparent; }}")
+
+    def _refresh_sep_btn_styles(self):
+        for btn in [self.chk_c, self.chk_m, self.chk_y, self.chk_k]:
+            color, _ = self._sep_btn_style.get(btn._sep_key, ("#888", "#888"))
+            btn.setStyleSheet(self._sep_btn_stylesheet(color, self._muted_color, btn.isChecked()))
+
     def _on_sep_btn_style(self, checked):
         btn = self.sender()
         color, _ = self._sep_btn_style.get(btn._sep_key, ("#888", "#888"))
-        muted = self._muted_color
-        if checked:
-            btn.setStyleSheet(
-                f"QPushButton {{ border: 1px solid {color}; border-left: 4px solid {color}; "
-                f"text-align: center; padding: 4px 8px; color: #fff; font-weight: normal; }}")
-        else:
-            btn.setStyleSheet(
-                f"QPushButton {{ border: 1px solid {muted}; border-left: 3px solid {color}; "
-                f"text-align: center; padding: 4px 8px; color: {muted}; font-weight: normal; }}")
+        btn.setStyleSheet(self._sep_btn_stylesheet(color, self._muted_color, checked))
 
     def _on_sep_changed(self):
         all_on = all([

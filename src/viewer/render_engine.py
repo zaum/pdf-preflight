@@ -156,8 +156,6 @@ class RenderEngine:
         if self.doc:
             self.doc.close()
             self.doc = None
-        self._mag_cache = None
-        self._mag_cache_key = None
         from preview.pdf_inspector import clear_cache
         clear_cache()
 
@@ -196,28 +194,40 @@ class RenderEngine:
             pix.height, pix.width, 4)
         return arr, page
 
-    def sample_cmyk(self, page_num, pdf_x, pdf_y):
+    def sample_cmyk(self, page_num, pdf_x, pdf_y, size=1):
         if not self.doc:
             return None
         page = self.doc[page_num]
-        clip = fitz.Rect(pdf_x - 0.5, pdf_y - 0.5, pdf_x + 0.5, pdf_y + 0.5)
+        half = size / 2.0
+        # Callers pass PDF user-space coords (bottom-left origin, y up).
+        # fitz's pixmap clip uses a top-left origin (y down), so flip y.
+        clip_y = page.rect.height - pdf_y
+        clip = fitz.Rect(pdf_x - half, clip_y - half, pdf_x + half, clip_y + half)
         mat = fitz.Matrix(100, 100)
         with _no_icc():
             pix = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csCMYK)
         samples = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
+        if size > 1:
+            return np.round(samples.reshape(-1, 4).mean(axis=0)).astype(np.uint8)
         cy = samples.shape[0] // 2
         cx = samples.shape[1] // 2
         return samples[cy, cx]
 
-    def sample_rgb(self, page_num, pdf_x, pdf_y):
+    def sample_rgb(self, page_num, pdf_x, pdf_y, size=1):
         if not self.doc:
             return None
         page = self.doc[page_num]
-        clip = fitz.Rect(pdf_x - 0.5, pdf_y - 0.5, pdf_x + 0.5, pdf_y + 0.5)
+        half = size / 2.0
+        # Callers pass PDF user-space coords (bottom-left origin, y up).
+        # fitz's pixmap clip uses a top-left origin (y down), so flip y.
+        clip_y = page.rect.height - pdf_y
+        clip = fitz.Rect(pdf_x - half, clip_y - half, pdf_x + half, clip_y + half)
         mat = fitz.Matrix(100, 100)
         with _RENDER_LOCK:
             pix = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csRGB)
         samples = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        if size > 1:
+            return np.round(samples.reshape(-1, 3).mean(axis=0)).astype(np.uint8)
         cy = samples.shape[0] // 2
         cx = samples.shape[1] // 2
         return samples[cy, cx]
@@ -298,83 +308,3 @@ class RenderEngine:
             'trim': page.trimbox,
         }
 
-    def build_magnifier_cache(self, page_num):
-        """Build the magnifier cache for a page (call from background thread).
-
-        Stores the raw CMYK pixmap — fast to build, RGB conversion is
-        deferred until cropping (on a tiny region).
-        """
-        if not self.doc:
-            return
-        cache_zoom = 4.0
-        cache_key = (page_num, id(self.doc))
-        if getattr(self, '_mag_cache_key', None) == cache_key and self._mag_cache is not None:
-            return
-
-        page = self.doc[page_num]
-        mat = fitz.Matrix(cache_zoom, cache_zoom)
-        with _no_icc():
-            pix_cmyk = page.get_pixmap(matrix=mat, colorspace=fitz.csCMYK)
-        if pix_cmyk.width == 0 or pix_cmyk.height == 0:
-            return
-        cmyk_arr = np.frombuffer(pix_cmyk.samples, dtype=np.uint8).reshape(
-            pix_cmyk.height, pix_cmyk.width, 4).copy()
-        self._mag_cache = cmyk_arr
-        self._mag_cache_key = cache_key
-
-    def render_magnifier_region(self, page_num, pdf_x, pdf_y,
-                                 capture_size_pt=20, output_size_px=200):
-        """Render a small area around a PDF point at high resolution.
-
-        Uses the pre-built CMYK cache; crops then converts to RGB via ICC.
-        Returns QImage (RGB, copied) or None on failure.
-        """
-        if not self.doc:
-            return None
-
-        cache_zoom = 4.0
-
-        cache_key = (page_num, id(self.doc))
-        # Do NOT build the cache synchronously here — building a full-page
-        # 4x CMYK pixmap on the main thread (inside paintEvent) freezes the UI.
-        # The cache is warmed on a background thread; until then return None so
-        # the magnifier falls back to fast QImage sampling.
-        if getattr(self, '_mag_cache_key', None) != cache_key or self._mag_cache is None:
-            return None
-
-        cmyk_cache = self._mag_cache
-        if cmyk_cache is None:
-            return None
-
-        page = self.doc[page_num]
-        ph = page.rect.height
-
-        # Map PDF coords to cache image pixels
-        cx_px = int(pdf_x * cache_zoom)
-        cy_px = int((ph - pdf_y) * cache_zoom)
-        half_px = int((capture_size_pt / 2.0) * cache_zoom)
-
-        x1 = max(0, cx_px - half_px)
-        y1 = max(0, cy_px - half_px)
-        x2 = min(cmyk_cache.shape[1], cx_px + half_px)
-        y2 = min(cmyk_cache.shape[0], cy_px + half_px)
-        crop_w = x2 - x1
-        crop_h = y2 - y1
-
-        if crop_w <= 0 or crop_h <= 0:
-            return None
-
-        # Crop tiny CMYK region and convert just that to RGB
-        crop_cmyk = cmyk_cache[y1:y2, x1:x2, :].copy()
-        icc_path = get_cmyk_icc_path(self.doc)
-        crop_rgb = self._icc_to_rgb(crop_cmyk, icc_path)
-
-        # Upscale with Lanczos for sharper magnifier image
-        pil_img = Image.fromarray(crop_rgb)
-        pil_img = pil_img.resize(
-            (output_size_px, output_size_px), Image.Resampling.LANCZOS)
-        crop_rgb = np.asarray(pil_img)
-
-        qimg = QImage(crop_rgb.data, crop_rgb.shape[1], crop_rgb.shape[0],
-                      crop_rgb.shape[1] * 3, QImage.Format.Format_RGB888)
-        return qimg
