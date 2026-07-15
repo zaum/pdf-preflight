@@ -1,12 +1,17 @@
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
-from PyQt6.QtCore import Qt, QPointF, QRectF, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QPointF, QRectF, QRect, QTimer, pyqtSignal
 from PyQt6.QtGui import (QPainter, QPixmap, QColor, QPen, QBrush,
-                         QTransform, QPainterPath, QFont, QFontMetricsF)
+                         QTransform, QPainterPath, QFont, QFontMetricsF,
+                         QImage)
 import math
 import time
+import numpy as np
 from collections import OrderedDict
 
 from .overlay import BoxOverlay
+
+# Diagonal hatch overlay color for the TAC (Total Area Coverage) limit view.
+TAC_OVERLAY_COLOR = QColor(0, 255, 0, 255)
 
 # Hide the right-click magnifier when the page is already displayed at or above
 # this zoom. The page display zoom is capped at 5.0 (main_window._MAX_RENDER_ZOOM),
@@ -37,6 +42,13 @@ class PageWidget(QGraphicsView):
         self._page = None
         self._render_zoom = 1.0
         self._overlay = BoxOverlay()
+        # TAC limit overlay: enabled flag, ink-limit (%) and per-page ink arrays
+        # (2D float arrays in percent, 0..~400). The arrays come from the main
+        # window, which computes them via the preflight analyzer.
+        self._tac_enabled = False
+        self._tac_limit = 300
+        self._tac_arrays = {}
+        self._tac_region_cache = None
         self._drag_start = None
         self._is_dragging = False
         self._overprint_active = False
@@ -151,6 +163,70 @@ class PageWidget(QGraphicsView):
         margin_h = max(r.height(), self.viewport().height()) * 2.0
         self.scene.setSceneRect(r.adjusted(-margin_w, -margin_h, margin_w, margin_h))
 
+    def set_tac_overlay(self, enabled, limit, arrays):
+        """Configure the TAC limit overlay.
+
+        ``enabled`` toggles drawing, ``limit`` is the ink coverage threshold in
+        percent (areas above it are hatched), ``arrays`` maps page index -> the
+        2D ink-percentage array for that page."""
+        self._tac_enabled = bool(enabled)
+        self._tac_limit = int(limit)
+        self._tac_arrays = arrays if arrays is not None else {}
+        self._tac_region_cache = None
+        self.viewport().update()
+
+    def _get_tac_overlay_image(self, arr, pw, ph):
+        """Build a cached overlay image that paints a bright-green diagonal
+        hatch only over the display pixels whose TAC exceeds the limit.
+
+        The low-resolution ink array is upscaled to the display size with
+        nearest-neighbour; a hatch brush fills the whole image, then
+        ``DestinationIn`` compositing keeps the hatch lines only where the mask
+        (over-limit pixels) is opaque, leaving everything else fully
+        transparent. The result is cached so repeated repaints (e.g. magnifier
+        moves) are a cheap blit."""
+        key = (id(arr), pw, ph, self._tac_limit)
+        cached = self._tac_region_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        h, w = arr.shape[:2]
+        if w == 0 or h == 0 or pw <= 0 or ph <= 0:
+            return None
+        over = (arr > self._tac_limit)
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[..., 3] = (over * 255).astype(np.uint8)
+        mask_low = QImage(rgba.tobytes(), w, h, w * 4,
+                          QImage.Format.Format_ARGB32).copy()
+        mask = mask_low.scaled(pw, ph,
+                               Qt.AspectRatioMode.IgnoreAspectRatio,
+                               Qt.TransformationMode.FastTransformation)
+        overlay = QImage(pw, ph, QImage.Format.Format_ARGB32_Premultiplied)
+        overlay.fill(0)
+        painter = QPainter(overlay)
+        painter.setBrush(QBrush(TAC_OVERLAY_COLOR,
+                                Qt.BrushStyle.DiagCrossPattern))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.fillRect(QRect(0, 0, pw, ph), painter.brush())
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_DestinationIn)
+        painter.drawImage(0, 0, mask)
+        painter.end()
+        self._tac_region_cache = (key, overlay)
+        return overlay
+
+    def _draw_tac_overlay(self, painter, rx, ry, rw, rh, page_index):
+        if not self._tac_enabled:
+            return
+        arr = self._tac_arrays.get(page_index) if page_index is not None else None
+        if arr is None or arr.size == 0:
+            return
+        pw = int(round(rw))
+        ph = int(round(rh))
+        overlay = self._get_tac_overlay_image(arr, pw, ph)
+        if overlay is None or overlay.isNull():
+            return
+        painter.drawImage(int(round(rx)), int(round(ry)), overlay)
+
     def set_detail_overlay(self, qimage, scene_x, scene_y, item_scale_x,
                             item_scale_y):
         """Place a high-resolution detail tile on top of the base pixmap.
@@ -200,7 +276,8 @@ class PageWidget(QGraphicsView):
             self._tooltip_label.setStyleSheet(
                 f"background: {self._tip_bg}; color: {self._tip_text}; "
                 f"padding: 6px 12px; border: 1px solid {self._tip_border}; "
-                f"border-radius: 3px; font: 14px monospace;"
+                f"border-radius: 3px; font-family: 'Courier New'; "
+                f"font-size: 15px;"
             )
             self._tooltip_label.setAttribute(
                 Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -536,6 +613,11 @@ class PageWidget(QGraphicsView):
 
         self._overlay.draw(painter, None, z, x_off_px, boxes=boxes, page_height=page_rect.height)
 
+        if self._tac_enabled:
+            self._draw_tac_overlay(painter, x_off_px, 0,
+                                   page_rect.width * z, page_rect.height * z,
+                                   pg.get('page'))
+
     def _draw_single_overlay(self, painter, page):
         z = self._render_zoom
 
@@ -582,6 +664,14 @@ class PageWidget(QGraphicsView):
                 painter.drawRect(bx1, by0, pw - bx1, by1 - by0)
 
         self._overlay.draw(painter, page, z)
+
+        if self._tac_enabled:
+            page_index = self._page.pages[0].get('page') if (
+                self._page is not None and getattr(self._page, 'pages', None)
+            ) else None
+            self._draw_tac_overlay(painter, 0, 0,
+                                   page.rect.width * z, page.rect.height * z,
+                                   page_index)
 
     def _overprint_font(self):
         f = QFont("sans-serif", int(10 * self._render_zoom))
@@ -751,14 +841,16 @@ class PageWidget(QGraphicsView):
         if badge is not None:
             c, m, y, k = (badge[0], badge[1], badge[2], badge[3])
 
-            label_font = QFont("monospace", 9)
+            label_font = QFont("Courier New", 10)
+            label_font.setStyleHint(QFont.StyleHint.Monospace)
+            label_font.setFixedPitch(True)
             painter.setFont(label_font)
 
             lines = [
-                f"C  {c:.0f}%",
-                f"M  {m:.0f}%",
-                f"Y  {y:.0f}%",
-                f"K  {k:.0f}%",
+                f"C  {c:3.0f} %",
+                f"M  {m:3.0f} %",
+                f"Y  {y:3.0f} %",
+                f"K  {k:3.0f} %",
             ]
             if self._mag_badge_approx:
                 lines.append("≈ approx")

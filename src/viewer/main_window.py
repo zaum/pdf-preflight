@@ -39,6 +39,19 @@ from preflight.rules import RuleEngine
 _CMYK_SOURCE_MAX_DIFF = 70
 
 
+def _set_elide(label, mode):
+    """Set a QLabel's text elide mode if the installed PyQt6 build exposes it.
+
+    Some PyQt6 builds (e.g. 6.11) dropped ``QLabel.setElideMode``/``
+    setTextElideMode`` entirely, so calling it crashes at startup. Guard the
+    call so the app runs on every build; when unavailable the label simply does
+    not elide (cosmetic only)."""
+    fn = getattr(label, 'setElideMode', None) or getattr(
+        label, 'setTextElideMode', None)
+    if fn is not None:
+        fn(mode)
+
+
 def _cmyk_diff(a, b):
     """Sum of absolute per-channel differences of two (C,M,Y,K) 0-255 tuples."""
     return abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]) + abs(a[3] - b[3])
@@ -499,17 +512,19 @@ class _RenderSignals(QObject):
 
 
 class _PageProxy:
-    def __init__(self, rect, boxes, rect2=None, boxes2=None, rect0=None, gap=0):
+    def __init__(self, rect, boxes, rect2=None, boxes2=None, rect0=None, gap=0,
+                 page1=None, page2=None):
         self.rect = rect
         r0 = rect0 if rect0 is not None else rect
-        self.pages = [{'rect': r0, 'boxes': boxes, 'x_offset': 0}]
+        self.pages = [{'rect': r0, 'boxes': boxes, 'x_offset': 0, 'page': page1}]
         for name in ('art', 'bleed', 'trim', 'media', 'crop'):
             b = boxes.get(name)
             if b is not None:
                 setattr(self, f'{name}box', b)
         if rect2 is not None and boxes2 is not None:
             x_off = r0.width + gap
-            self.pages.append({'rect': rect2, 'boxes': boxes2, 'x_offset': x_off})
+            self.pages.append({'rect': rect2, 'boxes': boxes2,
+                               'x_offset': x_off, 'page': page2})
             for name in ('art', 'bleed', 'trim', 'media', 'crop'):
                 b2 = boxes2.get(name)
                 if b2 is not None:
@@ -1206,7 +1221,6 @@ class PreflightWindow(QMainWindow):
         self.setAcceptDrops(True)
         self._settings = QSettings("PDFPreflight", "Viewer")
         self.setWindowTitle("PDF Preflight Viewer")
-        self._restore_geometry()
 
         self.render = RenderEngine()
         self.analyzer = PreflightAnalyzer()
@@ -1236,6 +1250,10 @@ class PreflightWindow(QMainWindow):
         self._center_on_page = False
         self._is_fit_viewport = False
         self._color_overlay_enabled = False
+        self._tac_enabled = False
+        self._tac_limit = 300
+        self._tac_arrays = {}
+        self._tac_last = None
         self._active_box_mask = None
         self._box_eye_btns = {}
         self._render_seq = 0
@@ -1271,6 +1289,8 @@ class PreflightWindow(QMainWindow):
 
         self._fullscreen_prefs = None  # saved prefs for fullscreen restore
         self._build_ui()
+        self._restore_geometry()
+        self._restore_dock_width()
         self._thumb_worker = FitzThumbWorker()
         self._thumb_worker.thumb_ready.connect(self.page_widget.set_overview_thumb)
         self._thumb_worker.tac_ready.connect(self._on_tac_ready)
@@ -1472,6 +1492,30 @@ class PreflightWindow(QMainWindow):
         if state is not None:
             self.restoreState(state)
 
+    def _restore_dock_width(self):
+        if not hasattr(self, "_dock"):
+            return
+        collapsed = (
+            str(self._settings.value("ui/dock_collapsed", False)).lower()
+            == "true")
+        if collapsed:
+            self._dock_collapse_btn.setArrowType(Qt.ArrowType.LeftArrow)
+            self._dock_collapsed = True
+            btn_w = self._dock_collapse_btn.width() + 4
+            self._dock.setMinimumWidth(btn_w)
+            self._dock.setMaximumWidth(btn_w)
+            self._dock_content.hide()
+        else:
+            w = self._settings.value("ui/dock_width", None)
+            if w is not None:
+                try:
+                    w = int(w)
+                except (TypeError, ValueError):
+                    w = None
+            if w is not None and w >= self._dock_content.minimumWidth():
+                self.resizeDocks(
+                    [self._dock], [w], Qt.Orientation.Horizontal)
+
     def _save_collapse_states(self):
         for key, blk in self._collapse_blocks.items():
             blk.save_state()
@@ -1584,6 +1628,24 @@ class PreflightWindow(QMainWindow):
         if spread_mode == 'normal':
             return page_num, page_num + 1 < self.render.page_count, False
         return page_num, False, False
+
+    def _current_spread_page_indices(self):
+        """Return the actual PDF page indices shown in the current view, in
+        left-to-right visual order. Used to tag spread sub-pages so per-page
+        overlays (e.g. TAC) line up with the correct page."""
+        rp, spread, iso = self._render_plan(self._current_page)
+        count = self.render.page_count
+        if iso:
+            return [self._current_page]
+        if spread:
+            if self._spread_mode() == 'offset':
+                left = rp
+                right = rp + 1 if rp + 1 < count else None
+            else:
+                left = self._current_page
+                right = self._current_page + 1 if self._current_page + 1 < count else None
+            return [left, right] if right is not None else [left]
+        return [self._current_page]
 
     def _render_cache_key(self, page_num=None):
         if page_num is None:
@@ -1954,30 +2016,44 @@ class PreflightWindow(QMainWindow):
             spread, is_offset_single, simulate_op, self._active_box_mask,
             cache_key, object_filter)
 
+    @staticmethod
+    def _fmt_mm(v):
+        """One-decimal mm value with trailing .0 removed (e.g. 210)."""
+        s = f"{v:.1f}"
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+
+    @staticmethod
+    def _fmt_signed_mm(v):
+        """Signed one-decimal mm value with trailing .0 removed."""
+        sign = "+" if v >= 0 else "-"
+        return sign + PreflightWindow._fmt_mm(abs(v))
+
     def _format_box(self, box):
         """Format box dimensions per settings: mm/pt/both"""
         unit = str(self._settings.value("ui/box_unit", "mm"))
         w_mm = box.width * 25.4 / 72
         h_mm = box.height * 25.4 / 72
         if unit == "mm":
-            return f"{w_mm:.1f} x {h_mm:.1f} mm"
+            return f"{self._fmt_mm(w_mm)} x {self._fmt_mm(h_mm)} mm"
         elif unit == "pt":
             return f"{box.width:.0f} x {box.height:.0f} pt"
         else:
-            return f"{box.width:.0f} x {box.height:.0f} pt ({w_mm:.1f} x {h_mm:.1f} mm)"
+            return f"{box.width:.0f} x {box.height:.0f} pt ({self._fmt_mm(w_mm)} x {self._fmt_mm(h_mm)} mm)"
 
     def _format_diff(self, dw, dh):
         unit = str(self._settings.value("ui/box_unit", "mm"))
         if unit == "mm":
             w = dw * 25.4 / 72
             h = dh * 25.4 / 72
-            return f"{w:+.1f} x {h:+.1f} mm"
+            return f"{self._fmt_signed_mm(w)} x {self._fmt_signed_mm(h)} mm"
         elif unit == "pt":
             return f"{dw:+.0f} x {dh:+.0f} pt"
         else:
             w = dw * 25.4 / 72
             h = dh * 25.4 / 72
-            return f"{dw:+.0f} x {dh:+.0f} pt ({w:+.1f} x {h:+.1f} mm)"
+            return f"{dw:+.0f} x {dh:+.0f} pt ({self._fmt_signed_mm(w)} x {self._fmt_signed_mm(h)} mm)"
 
     def _set_box_mask(self, name, active):
         if active:
@@ -2005,10 +2081,14 @@ class PreflightWindow(QMainWindow):
             color = '#212121' if 'light' in theme else '#e0e0e0'
         with open(path) as f:
             svg = f.read()
-        svg = svg.replace('fill="currentColor"', f'fill="{color}"')
         pixmap = QPixmap()
-        pixmap.loadFromData(svg.encode())
-        return QIcon(pixmap)
+        pixmap.loadFromData(svg.replace('fill="currentColor"', f'fill="{color}"').encode())
+        icon = QIcon(pixmap)
+        disabled_pixmap = QPixmap()
+        disabled_pixmap.loadFromData(
+            svg.replace('fill="currentColor"', 'fill="#808080"').encode())
+        icon.addPixmap(disabled_pixmap, QIcon.Mode.Disabled)
+        return icon
 
     def _toolbar_spacer(self, width=8):
         w = QWidget()
@@ -2178,7 +2258,7 @@ class PreflightWindow(QMainWindow):
 
         self._dock_content = QWidget()
         self._dock_content.setObjectName("dock_content")
-        self._dock_content.setMinimumWidth(480)
+        self._dock_content.setMinimumWidth(260)
         dp = self._dock_content.palette()
         dp.setColor(QPalette.ColorRole.Window, QColor('#1a1a1a'))
         self._dock_content.setPalette(dp)
@@ -2236,16 +2316,28 @@ class PreflightWindow(QMainWindow):
         gl.setHorizontalSpacing(4)
         self.l_c = QLabel("—")
         self.l_c.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.l_c.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        _set_elide(self.l_c, Qt.TextElideMode.ElideLeft)
         self.l_m = QLabel("—")
         self.l_m.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.l_m.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        _set_elide(self.l_m, Qt.TextElideMode.ElideLeft)
         self.l_y = QLabel("—")
         self.l_y.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.l_y.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        _set_elide(self.l_y, Qt.TextElideMode.ElideLeft)
         self.l_k = QLabel("—")
         self.l_k.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.l_k.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        _set_elide(self.l_k, Qt.TextElideMode.ElideLeft)
         self.l_op = QLabel("—")
         self.l_op.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.l_op.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        _set_elide(self.l_op, Qt.TextElideMode.ElideLeft)
         self.l_spot_info = QLabel("—")
         self.l_spot_info.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.l_spot_info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        _set_elide(self.l_spot_info, Qt.TextElideMode.ElideLeft)
         self.l_source = QLabel("")
         self.l_source.setStyleSheet("font-size: 9pt;")
         self.l_source.setVisible(False)
@@ -2427,6 +2519,55 @@ class PreflightWindow(QMainWindow):
         tac_l.setContentsMargins(4, 4, 4, 4)
         self.l_tac = QLabel("—")
         tac_l.addWidget(self.l_tac)
+        tac_ctl = QHBoxLayout()
+        tac_ctl.setContentsMargins(0, 4, 0, 0)
+        tac_ctl.setSpacing(6)
+        self.chk_tac_overlay = QCheckBox("Overlay")
+        self.chk_tac_overlay.setChecked(False)
+        self.chk_tac_overlay.toggled.connect(self._on_tac_overlay_changed)
+        tac_ctl.addWidget(self.chk_tac_overlay)
+        limit_lbl = QLabel("Limit")
+        limit_lbl.setStyleSheet("background: transparent;")
+        tac_ctl.addWidget(limit_lbl)
+        self.spin_tac_limit = QSpinBox()
+        self.spin_tac_limit.setRange(0, 400)
+        self.spin_tac_limit.setSingleStep(10)
+        self.spin_tac_limit.setValue(300)
+        self.spin_tac_limit.setSuffix("%")
+        self.spin_tac_limit.setStyleSheet(
+            "QSpinBox { background: transparent; }")
+        self.spin_tac_limit.valueChanged.connect(self._on_tac_overlay_changed)
+        tac_ctl.addWidget(self.spin_tac_limit)
+        # Limit slider: 10% steps, synced with the spin box both ways.
+        # Square handle + grey track (overrides the theme's blue fill).
+        self.slider_tac_limit = QSlider(Qt.Orientation.Horizontal)
+        self.slider_tac_limit.setRange(0, 400)
+        self.slider_tac_limit.setSingleStep(10)
+        self.slider_tac_limit.setPageStep(10)
+        self.slider_tac_limit.setValue(300)
+        self.slider_tac_limit.setTickPosition(QSlider.TickPosition.NoTicks)
+        self.slider_tac_limit.setStyleSheet(
+            "QSlider { background: transparent; }"
+            "QSlider::groove:horizontal {"
+            "  background: #6b6b6b; height: 4px; border-radius: 0px;"
+            "  border-image: none; }"
+            "QSlider::sub-page:horizontal {"
+            "  background: #9a9a9a; height: 4px; border-radius: 0px;"
+            "  border-image: none; }"
+            "QSlider::add-page:horizontal {"
+            "  background: #555555; height: 4px; border-radius: 0px;"
+            "  border-image: none; }"
+            "QSlider::handle:horizontal {"
+            "  background: #d0d0d0; width: 14px; height: 14px;"
+            "  margin: -5px 0; border: 1px solid #333333;"
+            "  border-image: none; border-radius: 0px; }"
+        )
+        self.slider_tac_limit.valueChanged.connect(
+            self.spin_tac_limit.setValue)
+        self.spin_tac_limit.valueChanged.connect(
+            self.slider_tac_limit.setValue)
+        tac_ctl.addWidget(self.slider_tac_limit, 1)
+        tac_l.addLayout(tac_ctl)
         blk.set_content(tw)
         self._collapse_blocks['tac'] = blk
         vl.addWidget(blk)
@@ -2878,10 +3019,10 @@ class PreflightWindow(QMainWindow):
         if self._color_overlay_enabled:
             show_on_shift = not show_on_shift
         tooltip_text = (
-            f"C  {cc:.0f}%\n"
-            f"M  {cm:.0f}%\n"
-            f"Y  {cy_:.0f}%\n"
-            f"K  {ck:.0f}%"
+            f"C  {cc:3.0f} %\n"
+            f"M  {cm:3.0f} %\n"
+            f"Y  {cy_:.0f} %\n"
+            f"K  {ck:.0f} %"
         )
         if (show_on_shift and shift_down) or (
                 not show_on_shift and not shift_down):
@@ -2913,7 +3054,7 @@ class PreflightWindow(QMainWindow):
         c, m, y_, k = self._hover_cmyk
 
         source_info = None
-        op_info = ""
+        op_line = "OP: —"
         if self.render.doc:
             source_info = self.render.get_source_color_at(self._current_page, px, py)
             from preview.overprint import check_overprint_at
@@ -2926,7 +3067,8 @@ class PreflightWindow(QMainWindow):
                     parts.append("Fill")
                 if op_result.get('stroke'):
                     parts.append("Stroke")
-                op_info = "\nOP: " + "+".join(parts) if parts else ""
+                if parts:
+                    op_line = "OP: " + "+".join(parts)
 
         self._update_cmyk_labels(
             (c, m, y_, k), px, py, source_info=source_info)
@@ -2943,11 +3085,12 @@ class PreflightWindow(QMainWindow):
                 tcc, tcm, tcy_, tck = self._choose_cmyk_display(
                     (c, m, y_, k), source_info)
                 tooltip_text = (
-                    f"C  {tcc:.0f}%\n"
-                    f"M  {tcm:.0f}%\n"
-                    f"Y  {tcy_:.0f}%\n"
-                    f"K  {tck:.0f}%"
-                    f"{op_info}"
+                    f"C  {tcc:3.0f} %\n"
+                    f"M  {tcm:3.0f} %\n"
+                    f"Y  {tcy_:3.0f} %\n"
+                    f"K  {tck:3.0f} %\n"
+                    f"\n"
+                    f"{op_line}"
                 )
                 self.page_widget.show_color_tooltip(
                     self.page_widget.viewport().mapFromGlobal(QCursor.pos()),
@@ -2965,6 +3108,9 @@ class PreflightWindow(QMainWindow):
         lbl = QLabel(label)
         lbl.setStyleSheet("font-weight: bold; background: transparent;")
         val = QLabel(value)
+        val.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        _set_elide(val, Qt.TextElideMode.ElideMiddle)
         if value_color:
             val.setStyleSheet(f"color: {value_color}; background: transparent;")
         else:
@@ -3085,12 +3231,13 @@ class PreflightWindow(QMainWindow):
             try:
                 tac = self.analyzer.calculate_tac(
                     self._current_page, zoom=0.3)
-                self.l_tac.setText(
-                    f"Max: {tac['max']:.1f}%\n"
-                    f"Avg: {tac['avg']:.1f}%\n"
-                    f">300%: {tac['over_limit_pixels']} / "
-                    f"{tac['total_pixels']} px"
-                )
+                self._tac_arrays[self._current_page] = tac.get('array')
+                self._tac_last = tac
+                self._update_tac_label(tac)
+                if self._tac_enabled:
+                    self.page_widget.set_tac_overlay(
+                        True, self._tac_limit, self._tac_arrays)
+                    self.page_widget.viewport().update()
             except Exception:
                 self.l_tac.setText("Error")
 
@@ -3118,28 +3265,43 @@ class PreflightWindow(QMainWindow):
             cs_lbl.setStyleSheet("font-weight: bold; background: transparent;")
             self.cs_grid_layout.addWidget(cs_lbl, row, 0)
             cs_widget = QWidget()
+            cs_widget.setSizePolicy(
+                QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
             cs_row = QHBoxLayout(cs_widget)
             cs_row.setContentsMargins(0, 0, 0, 0)
             cs_row.setSpacing(4)
-            cs_colors = {'RGB': '#f44336', 'CMYK': '#4caf50'}
-            for cs in sorted(ci['color_spaces']):
+            spaces = sorted(ci['color_spaces'])
+
+            def _cs_color(cs):
+                if cs == 'RGB':
+                    return '#f44336'
+                if cs.startswith(('CMYK', 'Gray', 'Separation', 'DeviceN')):
+                    return '#4caf50'
+                return None
+
+            for i, cs in enumerate(spaces):
                 cs_tag = QLabel(cs)
-                color = cs_colors.get(cs)
+                cs_tag.setSizePolicy(
+                    QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+                _set_elide(cs_tag, Qt.TextElideMode.ElideRight)
+                color = _cs_color(cs)
                 if color:
                     cs_tag.setStyleSheet(f"color: {color}; background: transparent; font-weight: bold;")
                 else:
                     cs_tag.setStyleSheet("background: transparent;")
                 cs_row.addWidget(cs_tag)
+                if i < len(spaces) - 1:
+                    sep = QLabel(",")
+                    sep.setStyleSheet("background: transparent;")
+                    cs_row.addWidget(sep)
             cs_row.addStretch()
             self.cs_grid_layout.addWidget(cs_widget, row, 1)
             row += 1
             # Page has overprint?
             try:
-                from preview.overprint import build_overprint_position_map
-                op_map = build_overprint_position_map(doc, page)
-                if op_map:
-                    fill_count = sum(1 for e in op_map if e['op_fill'])
-                    stroke_count = sum(1 for e in op_map if e['op_stroke'])
+                from preview.overprint import get_page_overprint
+                has_op, fill_count, stroke_count = get_page_overprint(doc, page)
+                if has_op:
                     parts = []
                     if fill_count:
                         parts.append(f"{fill_count} fill")
@@ -3172,12 +3334,15 @@ class PreflightWindow(QMainWindow):
         # PDF filename at bottom
         if self._current_path:
             fname_label = QLabel("File name")
-            fname_label.setStyleSheet("color: #fff; background: transparent; font-weight: bold; font-size: 9pt;")
+            fname_label.setStyleSheet("color: #fff; background: transparent; font-size: 9pt;")
             self.cs_grid_layout.addWidget(fname_label, row, 0)
             fname = os.path.basename(self._current_path)
             fname_val = QLabel(fname)
+            fname_val.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            _set_elide(fname_val, Qt.TextElideMode.ElideMiddle)
             fname_val.setStyleSheet(
-                "color: #fff; background: transparent; font-weight: bold; font-size: 9pt; text-decoration: underline;")
+                "color: #fff; background: transparent; font-size: 9pt; text-decoration: underline;")
             fname_val.setToolTip(self._current_path)
             fname_val.setCursor(Qt.CursorShape.PointingHandCursor)
             def _open_folder(e, p=self._current_path):
@@ -3189,9 +3354,9 @@ class PreflightWindow(QMainWindow):
                         pass
             fname_val.mousePressEvent = _open_folder
             fname_val.enterEvent = lambda e, lbl=fname_val: lbl.setStyleSheet(
-                "color: #fff; background: rgba(128,128,128,0.25); font-weight: bold; font-size: 9pt; text-decoration: underline;")
+                "color: #fff; background: rgba(128,128,128,0.25); font-size: 9pt; text-decoration: underline;")
             fname_val.leaveEvent = lambda e, lbl=fname_val: lbl.setStyleSheet(
-                "color: #fff; background: transparent; font-weight: bold; font-size: 9pt; text-decoration: underline;")
+                "color: #fff; background: transparent; font-size: 9pt; text-decoration: underline;")
             self.cs_grid_layout.addWidget(fname_val, row, 1)
 
         # Security
@@ -3283,6 +3448,12 @@ class PreflightWindow(QMainWindow):
         if self._magnifier_cache_timer is not None:
             self._magnifier_cache_timer.stop()
         self._save_collapse_states()
+        if getattr(self, "_dock_collapsed", False):
+            self._settings.setValue("ui/dock_collapsed", True)
+            self._settings.setValue("ui/dock_width", self._dock_old_width)
+        else:
+            self._settings.setValue("ui/dock_collapsed", False)
+            self._settings.setValue("ui/dock_width", self._dock.width())
         self._settings.setValue("window/geometry", self.saveGeometry())
         self._settings.setValue("window/state", self.saveState())
         self._settings.sync()
@@ -3388,11 +3559,14 @@ class PreflightWindow(QMainWindow):
                       QImage.Format.Format_RGB888)
         qimg = qimg.copy()
         if pg2_info is not None:
+            indices = self._current_spread_page_indices()
             proxy = _PageProxy(page_rect, boxes, pg2_info['rect'],
                               pg2_info['boxes'], rect0=pg2_info.get('rect0'),
-                              gap=pg2_info.get('gap', 0))
+                              gap=pg2_info.get('gap', 0),
+                              page1=indices[0],
+                              page2=indices[1] if len(indices) > 1 else None)
         else:
-            proxy = _PageProxy(page_rect, boxes)
+            proxy = _PageProxy(page_rect, boxes, page1=self._current_page)
         self._cmyk_buf = cmyk_buf
         self._overprint_on_page = has_op
         self.page_widget.resetTransform()
@@ -3551,6 +3725,7 @@ class PreflightWindow(QMainWindow):
             self.analyzer.open(path)
             self._set_load_progress(35)
             self._current_path = os.path.abspath(path)
+            self._tac_arrays = {}
             self._current_page = 0
             self._overview_active = False
             self._overview_entries = []
@@ -3565,6 +3740,15 @@ class PreflightWindow(QMainWindow):
             self.act_prev.setEnabled(multi)
             self.act_next.setEnabled(multi)
             self.act_last.setEnabled(multi)
+            self.act_spread.setEnabled(multi)
+            self.act_spread_offset.setEnabled(multi)
+            if multi:
+                self.act_single.setChecked(False)
+                self.act_spread.setChecked(True)
+                self.act_spread_offset.setChecked(False)
+            else:
+                self.act_spread.setChecked(False)
+                self.act_spread_offset.setChecked(False)
             self.spin_page.setEnabled(multi)
             self.spin_page.blockSignals(True)
             self.spin_page.setValue(1)
@@ -3584,7 +3768,10 @@ class PreflightWindow(QMainWindow):
                 self.simulation.clear_simulation_profile()
             self._set_load_progress(50)
             self._update_info()
-            self._zoom_fit()
+            if self._spread_mode() is not None:
+                self._fit_spread()
+            else:
+                self._zoom_fit()
         except Exception as e:
             self._finish_loading()
             QMessageBox.critical(self, "Error",
@@ -4136,14 +4323,30 @@ class PreflightWindow(QMainWindow):
         if not self._overview_active or page_index != self._current_page:
             return
         try:
-            self.l_tac.setText(
-                f"Max: {tac['max']:.1f}%\n"
-                f"Avg: {tac['avg']:.1f}%\n"
-                f">300%: {tac['over_limit_pixels']} / "
-                f"{tac['total_pixels']} px"
-            )
+            self._tac_arrays[page_index] = tac.get('array')
+            self._tac_last = tac
+            self._update_tac_label(tac)
+            if self._tac_enabled:
+                self.page_widget.set_tac_overlay(
+                    True, self._tac_limit, self._tac_arrays)
+                self.page_widget.viewport().update()
         except Exception:
             pass
+
+    def _update_tac_label(self, tac):
+        try:
+            self.l_tac.setText(f"Max: {tac['max']:.1f}%")
+        except Exception:
+            pass
+
+    def _on_tac_overlay_changed(self):
+        self._tac_limit = self.spin_tac_limit.value()
+        self._tac_enabled = self.chk_tac_overlay.isChecked()
+        if self._tac_last is not None:
+            self._update_tac_label(self._tac_last)
+        self.page_widget.set_tac_overlay(
+            self._tac_enabled, self._tac_limit, self._tac_arrays)
+        self.page_widget.viewport().update()
 
     def _update_overview_zoom(self):
         self.page_widget.set_overview_zoom(self._zoom)

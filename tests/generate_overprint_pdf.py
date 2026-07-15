@@ -26,10 +26,8 @@ def create_overprint_pdf(path):
 
     # Create an ExtGState object with overprint flags
     # xref for new ExtGState
-    op_gs_xref = doc.xref_new(
-        0,  # 0 = new object
-        "<< /Type /ExtGState /OP true /op true /OPM 1 >>"
-    )
+    op_gs_xref = doc.get_new_xref()
+    doc.xref_set_key(op_gs_xref, "", "<< /Type /ExtGState /OP true /op true /OPM 1 >>")
 
     # Modify page resources to include the ExtGState
     page = doc[0]

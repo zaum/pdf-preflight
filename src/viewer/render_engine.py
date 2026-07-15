@@ -203,9 +203,14 @@ class RenderEngine:
         # fitz's pixmap clip uses a top-left origin (y down), so flip y.
         clip_y = page.rect.height - pdf_y
         clip = fitz.Rect(pdf_x - half, clip_y - half, pdf_x + half, clip_y + half)
+        clip = clip & page.rect
+        if clip.is_empty or clip.is_infinite:
+            return None
         mat = fitz.Matrix(100, 100)
         with _no_icc():
             pix = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csCMYK)
+        if pix.width == 0 or pix.height == 0:
+            return None
         samples = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
         if size > 1:
             return np.round(samples.reshape(-1, 4).mean(axis=0)).astype(np.uint8)
@@ -222,9 +227,14 @@ class RenderEngine:
         # fitz's pixmap clip uses a top-left origin (y down), so flip y.
         clip_y = page.rect.height - pdf_y
         clip = fitz.Rect(pdf_x - half, clip_y - half, pdf_x + half, clip_y + half)
+        clip = clip & page.rect
+        if clip.is_empty or clip.is_infinite:
+            return None
         mat = fitz.Matrix(100, 100)
         with _RENDER_LOCK:
             pix = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csRGB)
+        if pix.width == 0 or pix.height == 0:
+            return None
         samples = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         if size > 1:
             return np.round(samples.reshape(-1, 3).mean(axis=0)).astype(np.uint8)

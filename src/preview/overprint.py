@@ -10,7 +10,7 @@ class OverprintPreview:
             pag_obj = page.parent.xref_object(page.xref)
             if '/ExtGState' in pag_obj:
                 egc = pag_obj.split('/ExtGState')[1]
-                if '/OP' in egc or '/op' in egc:
+                if re.search(r'/(OP|op)\s+true(?![A-Za-z])', egc):
                     return True
         except Exception:
             pass
@@ -18,7 +18,7 @@ class OverprintPreview:
             for xref_i in range(1, page.parent.xref_length()):
                 obj = page.parent.xref_object(xref_i)
                 if '/Type' in obj and '/ExtGState' in obj:
-                    if '/OP' in obj or '/op' in obj:
+                    if re.search(r'/(OP|op)\s+true(?![A-Za-z])', obj):
                         return True
         except Exception:
             pass
@@ -83,11 +83,13 @@ def _get_extgstate_overprints(doc, page):
             obj = doc.xref_object(xref)
         except Exception:
             continue
-        has_OP = '/OP' in obj
-        has_op = '/op' in obj
+        # IMPORTANT: /OP must NOT match /OPM (Overprint *Mode*), which is a
+        # different, very common key that does NOT enable overprint.
+        has_OP = bool(re.search(r'/OP(?![A-Za-z])', obj))
+        has_op = bool(re.search(r'/op(?![A-Za-z])', obj))
         if has_OP or has_op:
-            op_fill = '/OP true' in obj if has_OP else None
-            op_stroke = '/op true' in obj if has_op else None
+            op_fill = bool(re.search(r'/OP\s+true(?![A-Za-z])', obj)) if has_OP else None
+            op_stroke = bool(re.search(r'/op\s+true(?![A-Za-z])', obj)) if has_op else None
             result[name] = (has_OP, op_fill, has_op, op_stroke)
     return result
 
@@ -710,12 +712,51 @@ def simulate_overprint_on_cmyk(cmyk_arr, page, doc, active_channels=None):
 
 # --- Overprint position cache for fast cursor lookup ---
 
+_OP_CACHE = {}
+
 _OP_MAP_CACHE = {}
 
 
 def clear_overprint_cache():
     _OP_MAP_CACHE.clear()
+    _OP_CACHE.clear()
     _MASK_CACHE.clear()
+
+
+def get_page_overprint(doc, page):
+    """Return (has_overprint, fill_count, stroke_count) for a page.
+
+    This is a robust, geometry-independent answer to "does this page use
+    overprint?" It is based purely on the content stream: it tracks the
+    current ExtGState (via ``gs`` operators) and counts every painted
+    operation whose overprint fill (``/OP true``) or stroke (``/op true``)
+    flag is active. Unlike ``build_overprint_position_map`` it does NOT depend
+    on 1:1 correlation with ``get_cdrawings()``, so it does not miss
+    overprint that is defined but only applies to, e.g., strokes.
+
+    Use this for page-level overprint indicators (e.g. the Color Profiles
+    sidebar). Use ``build_overprint_position_map`` for per-position cursor
+    lookups."""
+    key = (id(doc), page.xref)
+    if key in _OP_CACHE:
+        return _OP_CACHE[key]
+
+    ops = _parse_content_sequence(doc, page)
+    if not ops:
+        res = (False, 0, 0)
+        _OP_CACHE[key] = res
+        return res
+
+    fill = 0
+    stroke = 0
+    for o in ops:
+        if o.get('overprint_fill'):
+            fill += 1
+        if o.get('overprint_stroke'):
+            stroke += 1
+    res = (bool(fill or stroke), fill, stroke)
+    _OP_CACHE[key] = res
+    return res
 
 
 def build_overprint_position_map(doc, page):
@@ -735,7 +776,14 @@ def build_overprint_position_map(doc, page):
         return []
 
     try:
-        drawings = page.get_cdrawings()
+        # Keep only drawings that actually paint (fill or stroke). Clip-only
+        # paths (e.g. ``re W n``) are returned by get_cdrawings() but do not
+        # consume a paint-operation slot in the parser, so without this filter
+        # the parser<->drawing index correlation drifts and overprint flags get
+        # attributed to the wrong geometry.
+        raw_drawings = page.get_cdrawings()
+        drawings = [d for d in raw_drawings
+                    if d.get('fill') is not None or d.get('stroke') is not None]
     except Exception:
         drawings = []
     try:
@@ -773,15 +821,13 @@ def build_overprint_position_map(doc, page):
             op_fill = op.get('overprint_fill', False)
             op_stroke = op.get('overprint_stroke', False)
 
-            # Filter based on operation type — a fill-only operation
-            # shouldn't show stroke overprint, and vice versa.
-            if op['type'] == 'path_fill':
-                op_stroke = False
-            elif op['type'] == 'path_stroke':
-                op_fill = False
-            elif op['type'] == 'text':
-                op_stroke = False
-
+            # Keep BOTH flags exactly as resolved from the applied ExtGState.
+            # This is intentionally NOT filtered by operation type so that it
+            # stays consistent with get_page_overprint() (which counts an op
+            # whenever its overprint fill/stroke flag is active). A fill-only
+            # object that has the stroke-overprint flag set will therefore
+            # report "Stroke" on hover, matching the page-level "Yes — N
+            # stroke" summary.
             if op_fill or op_stroke:
                 # Filter out entries with bbox covering >50% of page area
                 # (e.g. combined trim marks or registration mark groups)
@@ -799,15 +845,16 @@ def build_overprint_position_map(doc, page):
 
         elif op['type'] == 'text':
             op_fill = op.get('overprint_fill', False)
-            if not op_fill:
+            op_stroke = op.get('overprint_stroke', False)
+            if not (op_fill or op_stroke):
                 continue
             if text_idx < len(text_spans):
                 span = text_spans[text_idx]
                 text_idx += 1
                 result.append({
                     'bbox': tuple(span['bbox']),
-                    'op_fill': True,
-                    'op_stroke': False,
+                    'op_fill': op_fill,
+                    'op_stroke': op_stroke,
                 })
 
     _OP_MAP_CACHE[key] = result

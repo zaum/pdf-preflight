@@ -135,6 +135,34 @@ class PreflightAnalyzer:
             pass
         return f"ICC xref={xri}"
 
+    def _collect_referenced_xrefs(self):
+        """Return the set of xref numbers reachable from any page.
+
+        Walks page objects, their resources and all referenced children
+        (XObjects, forms, fonts, ExtGStates, content streams, ...) so that
+        only colour spaces actually used by the document are reported.
+        """
+        referenced = set()
+        stack = []
+        try:
+            stack.append(self.doc.pdf_catalog())
+        except Exception:
+            pass
+        for pgi in range(self.doc.page_count):
+            stack.append(self.doc[pgi].xref)
+        while stack:
+            xri = stack.pop()
+            if xri in referenced or xri < 1:
+                continue
+            referenced.add(xri)
+            try:
+                obj = self.doc.xref_object(xri)
+            except Exception:
+                continue
+            for m in re.finditer(r'(\d+) 0 R', obj):
+                stack.append(int(m.group(1)))
+        return referenced
+
     def _icc_colorspace(self, xref_num):
         try:
             raw = self.doc.xref_stream(xref_num)
@@ -152,6 +180,104 @@ class PreflightAnalyzer:
             pass
         return None
 
+    def _classify_cs_def(self, text):
+        """Classify a colour-space definition (object string) into a label."""
+        t = text or ''
+        if '/Separation' in t:
+            m = re.search(r'/Separation\s+/(\w+)', t)
+            return f'Separation: {m.group(1)}' if m else 'Separation'
+        if '/DeviceN' in t:
+            m = re.search(r'/DeviceN\s*\[([^\]]*)\]', t)
+            if m:
+                names = [n.strip('/') for n in m.group(1).split()
+                         if n.strip().startswith('/')]
+                if names:
+                    if len(names) <= 4:
+                        return 'DeviceN: ' + '/'.join(names)
+                    return f'DeviceN ({len(names)})'
+            return 'DeviceN'
+        if '/Indexed' in t:
+            return 'Indexed'
+        if '/Pattern' in t:
+            return 'Pattern'
+        if '/Lab' in t:
+            return 'Lab'
+        if '/ICCBased' in t:
+            m = re.search(r'/ICCBased\s+(\d+)', t)
+            if m:
+                cs = self._icc_colorspace(int(m.group(1)))
+                if cs:
+                    return cs
+            return 'ICC'
+        if '/DeviceCMYK' in t:
+            return 'CMYK'
+        if '/DeviceRGB' in t:
+            return 'RGB'
+        if '/DeviceGray' in t:
+            return 'Gray'
+        return None
+
+    def _page_resources_obj(self, page):
+        try:
+            pobj = self.doc.xref_object(page.xref)
+            m = re.search(r'/Resources\s+(\d+) 0 R', pobj)
+            if not m:
+                return None
+            return self.doc.xref_object(int(m.group(1)))
+        except Exception:
+            return None
+
+    def _resolve_named_cs(self, page, name):
+        """Resolve a named (resource) colour space to a label."""
+        try:
+            robj = self._page_resources_obj(page)
+            if not robj:
+                return None
+            m = re.search(r'/ColorSpace\s*<<(.*?)>>', robj, re.DOTALL)
+            if not m:
+                return None
+            cs = m.group(1)
+            mm = re.search(r'/' + re.escape(name) + r'\s+(\d+) 0 R', cs)
+            if mm:
+                return self._classify_cs_def(self.doc.xref_object(int(mm.group(1))))
+            mm = re.search(r'/' + re.escape(name) + r'\s+(\[.*?\]|/\w+)', cs)
+            if mm:
+                return self._classify_cs_def(mm.group(1))
+        except Exception:
+            pass
+        return None
+
+    def _content_color_spaces(self):
+        """Colour spaces actually used in page content streams.
+
+        Uses the content-stream parser so that implicit operators
+        (e.g. ``k`` for DeviceCMYK) and image XObjects are covered.
+        """
+        spaces = set()
+        try:
+            from preview.content_stream import PageColorExtractor
+            parser = PageColorExtractor(self.doc)
+            for pgi in range(self.doc.page_count):
+                page = self.doc[pgi]
+                try:
+                    recs = parser.extract_page_colors(pgi)
+                except Exception:
+                    recs = []
+                for r in recs:
+                    for key in ('fill_cs', 'stroke_cs'):
+                        cs = r.get(key)
+                        if not cs:
+                            continue
+                        if cs in ('DeviceRGB', 'DeviceCMYK', 'DeviceGray'):
+                            spaces.add(cs.replace('Device', ''))
+                        elif cs.startswith('/'):
+                            label = self._resolve_named_cs(page, cs[1:])
+                            if label:
+                                spaces.add(label)
+        except Exception:
+            pass
+        return spaces
+
     def get_color_info(self):
         info = {
             'color_spaces': set(),
@@ -163,32 +289,36 @@ class PreflightAnalyzer:
         if not self.doc:
             return info
 
-        for pgi in range(self.doc.page_count):
-            page = self.doc[pgi]
-            try:
-                pag_obj = self.doc.xref_object(page.xref)
-                for cs in ('/DeviceRGB', '/DeviceCMYK', '/DeviceGray'):
-                    if cs in pag_obj:
-                        info['color_spaces'].add(cs.replace('/Device', ''))
-            except Exception:
-                pass
+        # Colour spaces actually used by page content (vector/text/operators
+        # and image XObjects via the parser's recursion).
+        for cs in self._content_color_spaces():
+            info['color_spaces'].add(cs)
 
-        for xri in range(1, self.doc.xref_length()):
+        # Complementary scan of referenced objects (images, ExtGStates,
+        # transparency groups, used ICC profiles). Orphan/unreferenced
+        # objects (e.g. a dead sRGB profile) are intentionally ignored.
+        referenced = self._collect_referenced_xrefs()
+        for xri in referenced:
             try:
                 obj = self.doc.xref_object(xri)
+                for cs in ('/DeviceRGB', '/DeviceCMYK', '/DeviceGray'):
+                    if cs in obj:
+                        info['color_spaces'].add(cs.replace('/Device', ''))
                 if '/ICCBased' in obj:
+                    icc_xref = xri
                     m_icc = re.search(r'/ICCBased\s+(\d+)', obj)
-                    icc_xref = int(m_icc.group(1)) if m_icc else xri
+                    if m_icc:
+                        icc_xref = int(m_icc.group(1))
                     name = self._icc_name_from_obj(icc_xref, obj)
-                    info['icc_profiles'].append(name)
+                    if name not in info['icc_profiles']:
+                        info['icc_profiles'].append(name)
                     try:
                         desc = self._parse_icc_description(icc_xref)
-                        if desc:
-                            info['icc_profile_descriptions'].append(desc)
-                        else:
-                            info['icc_profile_descriptions'].append(name)
+                        d = desc if desc else name
                     except Exception:
-                        info['icc_profile_descriptions'].append(name)
+                        d = name
+                    if d not in info['icc_profile_descriptions']:
+                        info['icc_profile_descriptions'].append(d)
 
                     cs = self._icc_colorspace(icc_xref)
                     if cs:
