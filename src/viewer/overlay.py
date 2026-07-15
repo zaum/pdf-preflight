@@ -19,8 +19,28 @@ BOX_LABELS = {
 }
 
 
+def _format_box_dims(box, unit):
+    if unit == "pt":
+        return f"{box.width:.0f} x {box.height:.0f} pt"
+    elif unit == "both":
+        w_mm = box.width * 25.4 / 72
+        h_mm = box.height * 25.4 / 72
+        return f"{box.width:.0f} x {box.height:.0f} pt ({w_mm:.1f} x {h_mm:.1f} mm)"
+    else:  # mm
+        w_mm = box.width * 25.4 / 72
+        h_mm = box.height * 25.4 / 72
+
+        def fmt(v):
+            s = f"{v:.1f}"
+            if s.endswith(".0"):
+                s = s[:-2]
+            return s
+
+        return f"{fmt(w_mm)} x {fmt(h_mm)} mm"
+
+
 def draw_box(painter, box, zoom, page_height, color, style, label=None,
-             x_offset=0):
+             x_offset=0, unit="mm", label_gap=8):
     if box.x0 >= box.x1 or box.y0 >= box.y1:
         return
 
@@ -36,12 +56,15 @@ def draw_box(painter, box, zoom, page_height, color, style, label=None,
     painter.drawRect(int(x0), int(y0), int(w), int(h))
 
     if label:
-        painter.drawText(int(x0) + 4, int(y0) - 2, label)
+        dims = _format_box_dims(box, unit)
+        text = f"{label}  {dims}"
+        painter.drawText(int(x0) + label_gap, int(y0) - label_gap, text)
 
 
 class BoxOverlay:
     def __init__(self):
         self.active_boxes = set()
+        self.unit = "mm"
 
     def toggle_box(self, box_name):
         if box_name in self.active_boxes:
@@ -76,4 +99,4 @@ class BoxOverlay:
                 color, style = BOX_STYLES.get(name, BOX_STYLES['media'])
                 label = BOX_LABELS.get(name)
                 draw_box(painter, b, zoom, ph, color, style, label,
-                         x_offset)
+                         x_offset, unit=self.unit)

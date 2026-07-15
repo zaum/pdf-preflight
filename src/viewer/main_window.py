@@ -25,7 +25,9 @@ from PyQt6.QtWidgets import QSizePolicy
 from PyQt6.QtGui import QAction, QFont, QCursor, QImage, QIcon, QKeySequence, QShortcut, QPalette, QColor, QPixmap, QFontMetrics
 
 from viewer.page_widget import PageWidget
-from viewer.render_engine import RenderEngine, get_cmyk_icc_path
+from viewer.render_engine import (
+    RenderEngine, get_cmyk_icc_path, _RENDER_LOCK,
+    _disable_overprint, _restore_overprint)
 from preview.color_picker import ColorPicker
 from preview.overprint import OverprintPreview
 from preview.separation import SeparationPreview
@@ -433,6 +435,8 @@ class SettingsDialog(QDialog):
 
     def _on_unit_changed(self, unit):
         self._settings.setValue("ui/box_unit", unit)
+        if hasattr(self, 'page_widget'):
+            self.page_widget.overlay.unit = unit
         self.box_unit_changed.emit(unit)
 
     def _on_density_changed(self, value):
@@ -607,6 +611,40 @@ def _get_bg_icc_transform(icc_path):
         _bg_icc_transform_cache[icc_path] = transform
         return transform
 
+def _crop_cmyk_to_clip(arr, clip, zoom, page):
+    """Crop a full-page CMYK array to the given clip rect (page coordinates)."""
+    cx0 = int(max(0, min(arr.shape[1], round(clip.x0 * zoom))))
+    cx1 = int(max(0, min(arr.shape[1], round(clip.x1 * zoom))))
+    cy0 = int(max(0, min(arr.shape[0],
+                         round((page.rect.height - clip.y1) * zoom))))
+    cy1 = int(max(0, min(arr.shape[0],
+                         round((page.rect.height - clip.y0) * zoom))))
+    if cx1 <= cx0 or cy1 <= cy0:
+        return np.zeros((0, 0, 4), dtype=arr.dtype)
+    return arr[cy0:cy1, cx0:cx1]
+
+
+def _render_full_cmyk(pg, doc, mat, simulate_overprint):
+    """Render the full page to a raw CMYK numpy array (overprint optionally
+    disabled), for use when an overprint/separation simulation must run on a
+    full-page coordinate grid (e.g. clipped detail/magnifier tiles)."""
+    modified = []
+    with _RENDER_LOCK:
+        old_icc = fitz.TOOLS.set_icc(0)
+        try:
+            # Always render knockout: this helper exists only to feed the
+            # overprint/simulation, which reconstructs overprint itself. A
+            # native-overprint base would double-apply ink and smear it.
+            modified = _disable_overprint(doc)
+            pix = pg.get_pixmap(matrix=mat, colorspace=fitz.csCMYK)
+        finally:
+            fitz.TOOLS.set_icc(old_icc)
+            if modified:
+                _restore_overprint(doc, modified)
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+        pix.height, pix.width, 4)
+
+
 def render_one_data(doc, page_num, zoom, mode, channels, icc_path,
                     sim_profile, simulate_overprint, clip=None,
                     object_filter=None):
@@ -629,9 +667,14 @@ def render_one_data(doc, page_num, zoom, mode, channels, icc_path,
         with _RENDER_LOCK:
             old_icc = fitz.TOOLS.set_icc(0)
             try:
-                if not simulate_overprint:
-                    from viewer.render_engine import _disable_overprint
-                    modified = _disable_overprint(doc)
+                # The CMYK base is always rendered in knockout: overprint is
+                # either off (separation/normal) or reconstructed from the
+                # content stream by simulate_overprint_on_cmyk below. Rendering
+                # with native overprint here too would double-apply it and smear
+                # ink across the page (visible as a shifted arrow in clipped/
+                # cropped views).
+                from viewer.render_engine import _disable_overprint
+                modified = _disable_overprint(doc)
                 if clip is not None:
                     pix_cmyk = pg.get_pixmap(matrix=mat, clip=clip,
                                              colorspace=fitz.csCMYK)
@@ -658,15 +701,34 @@ def render_one_data(doc, page_num, zoom, mode, channels, icc_path,
             if has_op and simulate_overprint:
                 # MuPDF's get_pixmap ignores overprint, so we must simulate it
                 # ourselves by reconstructing the page in content-stream order.
-                display_cmyk = simulate_overprint_on_cmyk(cmyk_arr, pg, doc)
+                if clip is not None:
+                    # The simulation reconstructs the page using absolute page
+                    # coordinates; a clipped array would be mis-positioned. Run
+                    # it on a full-page grid and crop the result to the clip.
+                    full = _render_full_cmyk(pg, doc, mat, simulate_overprint)
+                    sim = simulate_overprint_on_cmyk(full, pg, doc)
+                    display_cmyk = _crop_cmyk_to_clip(sim, clip, zoom, pg)
+                else:
+                    display_cmyk = simulate_overprint_on_cmyk(cmyk_arr, pg, doc)
         elif mode == "separation":
             from preview.separation import SeparationPreview
             sp = SeparationPreview()
-            display_cmyk = sp.composite(cmyk_arr, channels)
-            if simulate_overprint:
-                from preview.overprint import simulate_overprint_on_cmyk
-                display_cmyk = simulate_overprint_on_cmyk(
-                    display_cmyk, pg, doc, active_channels=channels)
+            if clip is not None:
+                # Same coordinate-grid concern as overprint mode: simulate on a
+                # full-page grid, then separate and crop to the clip.
+                full = _render_full_cmyk(pg, doc, mat, simulate_overprint)
+                sep = sp.composite(full, channels)
+                if simulate_overprint:
+                    from preview.overprint import simulate_overprint_on_cmyk
+                    sep = simulate_overprint_on_cmyk(
+                        sep, pg, doc, active_channels=channels)
+                display_cmyk = _crop_cmyk_to_clip(sep, clip, zoom, pg)
+            else:
+                display_cmyk = sp.composite(cmyk_arr, channels)
+                if simulate_overprint:
+                    from preview.overprint import simulate_overprint_on_cmyk
+                    display_cmyk = simulate_overprint_on_cmyk(
+                        display_cmyk, pg, doc, active_channels=channels)
         # Fast RGB draft: use MuPDF csRGB on raw pixmap, or PIL convert
         if display_cmyk is cmyk_arr and mode != "overprint":
             pix_rgb = fitz.Pixmap(fitz.csRGB, pix_cmyk)
@@ -1592,10 +1654,10 @@ class PreflightWindow(QMainWindow):
             btn.setStyleSheet(self._sep_btn_stylesheet(color, muted, btn.isChecked()))
         if hasattr(self, '_btn_curves'):
             self._btn_curves.setStyleSheet(
-                f"QPushButton {{ border: 1px solid {accent}; color: {muted}; "
+                f"QPushButton {{ border: 1px solid {accent}; color: white; "
                 f"border-radius: 4px; padding: 6px 16px; font-weight: normal; font-size: 9pt; }}"
-                f"QPushButton:hover {{ border: 1px solid {accent}; color: {accent}; }}"
-                f"QPushButton:pressed {{ border: 1px solid {accent}; color: {accent}; }}")
+                f"QPushButton:hover {{ border: 1px solid {accent}; color: white; }}"
+                f"QPushButton:pressed {{ border: 1px solid {accent}; color: white; }}")
 
     def _update_sidebar_colors(self, is_light):
         dock_bg = '#d0d0d0' if is_light else '#404040'
@@ -2110,6 +2172,7 @@ class PreflightWindow(QMainWindow):
 
     def _build_ui(self):
         self.page_widget = PageWidget()
+        self.page_widget.overlay.unit = str(self._settings.value("ui/box_unit", "mm"))
         self.page_widget.set_sampler_size(self._sampler_size())
         self.page_widget.viewport().setAcceptDrops(True)
         self.page_widget.viewport().installEventFilter(self)
@@ -2450,13 +2513,14 @@ class PreflightWindow(QMainWindow):
 
         from preview.object_filter import CATEGORIES, LABELS
         self._of_rows = {}
+        # Per-category availability on the current page. Categories that are
+        # absent are shown in light gray and cannot be toggled.
+        self._of_available = {k: True for k in CATEGORIES}
 
         def _make_of_cb(key):
             cb = QCheckBox(LABELS[key].lower())
             cb.setChecked(True)
-            cb.setStyleSheet(
-                "QCheckBox { font-size: 9pt; color: #fff; background: transparent; }"
-                "QCheckBox::indicator { width: 14px; height: 14px; }")
+            cb.setStyleSheet(self._style_of_cb(cb, key))
             cb.toggled.connect(
                 lambda checked, k=key: self._on_of_toggle(k, checked))
             self._of_rows[key] = cb
@@ -2513,7 +2577,7 @@ class PreflightWindow(QMainWindow):
         vl.addWidget(blk)
 
         # TAC
-        blk = CollapsibleBlock("TAC (Total Area Coverage)", "tac")
+        blk = CollapsibleBlock("Total Area Coverage", "tac")
         tw = QWidget()
         tac_l = QVBoxLayout(tw)
         tac_l.setContentsMargins(4, 4, 4, 4)
@@ -2535,11 +2599,20 @@ class PreflightWindow(QMainWindow):
         self.spin_tac_limit.setValue(300)
         self.spin_tac_limit.setSuffix("%")
         self.spin_tac_limit.setStyleSheet(
-            "QSpinBox { background: transparent; }")
+            "QSpinBox { background: transparent; border: none; padding: 0px; }"
+            "QSpinBox:focus, QSpinBox:focus:hover { background: transparent; "
+            "border: none; outline: none; }"
+            "QSpinBox::edit-field { background: transparent; border: none; }"
+            "QSpinBox QLineEdit { background: transparent; border: none; "
+            "selection-background-color: transparent; }"
+            "QSpinBox::up-button, QSpinBox::down-button { width: 0px; "
+            "border: none; background: transparent; }"
+            "QSpinBox::up-arrow, QSpinBox::down-arrow { width: 0px; "
+            "height: 0px; }")
         self.spin_tac_limit.valueChanged.connect(self._on_tac_overlay_changed)
         tac_ctl.addWidget(self.spin_tac_limit)
         # Limit slider: 10% steps, synced with the spin box both ways.
-        # Square handle + grey track (overrides the theme's blue fill).
+        # Round (circular) handle + grey track (overrides the theme's blue fill).
         self.slider_tac_limit = QSlider(Qt.Orientation.Horizontal)
         self.slider_tac_limit.setRange(0, 400)
         self.slider_tac_limit.setSingleStep(10)
@@ -2549,18 +2622,18 @@ class PreflightWindow(QMainWindow):
         self.slider_tac_limit.setStyleSheet(
             "QSlider { background: transparent; }"
             "QSlider::groove:horizontal {"
-            "  background: #6b6b6b; height: 4px; border-radius: 0px;"
+            "  background: #6b6b6b; height: 4px; border-radius: 2px;"
             "  border-image: none; }"
             "QSlider::sub-page:horizontal {"
-            "  background: #9a9a9a; height: 4px; border-radius: 0px;"
+            "  background: #9a9a9a; height: 4px; border-radius: 2px;"
             "  border-image: none; }"
             "QSlider::add-page:horizontal {"
-            "  background: #555555; height: 4px; border-radius: 0px;"
+            "  background: #555555; height: 4px; border-radius: 2px;"
             "  border-image: none; }"
             "QSlider::handle:horizontal {"
-            "  background: #d0d0d0; width: 14px; height: 14px;"
-            "  margin: -5px 0; border: 1px solid #333333;"
-            "  border-image: none; border-radius: 0px; }"
+            "  background: #d0d0d0; width: 16px; height: 16px;"
+            "  margin: -6px 0; border: 1px solid #333333;"
+            "  border-image: none; border-radius: 8px; }"
         )
         self.slider_tac_limit.valueChanged.connect(
             self.spin_tac_limit.setValue)
@@ -2598,7 +2671,7 @@ class PreflightWindow(QMainWindow):
         self._font_all_pages.setChecked(True)
         self._font_all_pages.toggled.connect(self._update_info)
         hl.addWidget(self._font_all_pages)
-        self._btn_curves = QPushButton("Convert to curves")
+        self._btn_curves = QPushButton("Convert to Curves")
         self._btn_curves.clicked.connect(self._fonts_to_curves)
         self._btn_curves.setStyleSheet(
             f"QPushButton {{ border: 1px solid {self._accent_color}; color: white; "
@@ -3054,7 +3127,7 @@ class PreflightWindow(QMainWindow):
         c, m, y_, k = self._hover_cmyk
 
         source_info = None
-        op_line = "OP: —"
+        op_line = "OP ─"
         if self.render.doc:
             source_info = self.render.get_source_color_at(self._current_page, px, py)
             from preview.overprint import check_overprint_at
@@ -3157,6 +3230,9 @@ class PreflightWindow(QMainWindow):
         doc = self.render.doc
         page = doc[self._current_page]
 
+        # Object Filter: gray out + disable categories absent on this page.
+        self._update_object_filter_availability(page)
+
         # Boxes + page size with eye icons and diff
         boxes = self.render.get_page_boxes(page)
         self._clear_grid(self.boxes_grid_layout)
@@ -3253,7 +3329,8 @@ class PreflightWindow(QMainWindow):
             no_item = QListWidgetItem("(no fonts)")
             no_item.setSizeHint(QSize(0, 22))
             self.font_list.addItem(no_item)
-        visible = min(self.font_list.count(), 4) if self.font_list.count() else 1
+        visible = self.font_list.count() if self.font_list.count() else 1
+        visible = min(visible, 20)
         self.font_list.setFixedHeight(visible * 22 + 2)
 
         # Color spaces
@@ -4099,13 +4176,61 @@ class PreflightWindow(QMainWindow):
             self._of_update_reset_visibility()
             self._on_of_changed()
 
+    def _style_of_cb(self, cb, key):
+        """Style sheet for an object-filter checkbox, reflecting whether the
+        category is present (white, enabled) or absent (light gray, disabled)
+        on the current page."""
+        avail = self._of_available.get(key, True)
+        color = "#fff" if avail else "#888"
+        return (
+            "QCheckBox { font-size: 9pt; color: " + color +
+            "; background: transparent; }"
+            "QCheckBox::indicator { width: 14px; height: 14px; }"
+            "QCheckBox:disabled { color: #888; }")
+
+    def _page_has_category(self, page, key):
+        """Return True if the given page contains any object of `key`."""
+        try:
+            if key == 'images':
+                return len(page.get_images()) > 0
+            if key == 'text':
+                from preview.pdf_inspector import _get_text_dict
+                td = _get_text_dict(page)
+                if not td:
+                    return False
+                for blk in td.get('blocks', []):
+                    if blk.get('type', 0) == 0 and blk.get('lines'):
+                        return True
+                return False
+            if key == 'vector':
+                from preview.pdf_inspector import _get_drawings
+                dw = _get_drawings(page)
+                return bool(dw)
+        except Exception:
+            return False
+        return True
+
+    def _update_object_filter_availability(self, page):
+        """Enable/disable each object-filter checkbox based on whether the
+        current page actually contains that object category."""
+        if page is None:
+            return
+        for key, cb in self._of_rows.items():
+            avail = self._page_has_category(page, key)
+            self._of_available[key] = avail
+            cb.setEnabled(avail)
+            cb.setStyleSheet(self._style_of_cb(cb, key))
+
     def _on_of_reset(self):
         """Reset all categories to default (all on)."""
         self._of_batch_update = True
         for cb in self._of_rows.values():
             cb.setChecked(True)
-            cb.setEnabled(True)
         self._of_batch_update = False
+        # Re-apply enabled/disabled state for the current page's content.
+        if self.render.doc is not None:
+            self._update_object_filter_availability(
+                self.render.doc[self._current_page])
         self._of_update_reset_visibility()
         self._on_of_changed()
 
@@ -4129,9 +4254,7 @@ class PreflightWindow(QMainWindow):
         from preview.object_filter import LABELS
         for key, cb in self._of_rows.items():
             cb.setText(LABELS[key].lower())
-            cb.setStyleSheet(
-                "QCheckBox { font-size: 9pt; color: #fff; }"
-                "QCheckBox::indicator { width: 14px; height: 14px; }")
+            cb.setStyleSheet(self._style_of_cb(cb, key))
 
     # ===================== Overview (zoom-driven) =====================
     def _page_dims_for_fit(self, page_num):

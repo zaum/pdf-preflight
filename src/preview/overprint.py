@@ -217,6 +217,23 @@ def _parse_content_sequence(doc, page):
                 pos += 1
                 continue
 
+            # XObject (image / Form XObject) placement.
+            # get_cdrawings() reports these as drawings too: an image becomes a
+            # single rect drawing, and a Form XObject is expanded into its own
+            # path drawings. The operation<->drawing index correlation in
+            # simulate_overprint_on_cmyk() would otherwise drift by the number
+            # of XObjects, painting every later object's ink onto the wrong
+            # geometry -- which made vector elements (e.g. arrows) "jump" to the
+            # wrong position. Record the placement so the index stays aligned.
+            if tok == 'Do':
+                operations.append({
+                    'type': 'xobject',
+                    'overprint_fill': gs['overprint_fill'],
+                    'overprint_stroke': gs['overprint_stroke'],
+                })
+                pos += 1
+                continue
+
             # Fill color
             if tok == 'k':
                 ops = _pop(4)
@@ -570,8 +587,11 @@ def simulate_overprint_on_cmyk(cmyk_arr, page, doc, active_channels=None):
         return cmyk_arr.copy()
 
     # Get drawings for geometry (rgb colors, but we use cs parser for cmyk).
-    # Only keep drawings that actually paint (fill or stroke); clip-only
-    # paths have neither and must not consume a paint-operation slot.
+    # In this PyMuPDF version get_cdrawings() reports `fill`/`stroke` as the
+    # actual color (RGB/CMYK tuple) or None when the path is not painted, and
+    # `fill_color`/`stroke_color` are not populated. So a path paints when
+    # `fill`/`stroke` is not None. Clip-only paths have both None and are
+    # excluded automatically.
     try:
         raw_drawings = page.get_cdrawings()
     except Exception:
@@ -628,46 +648,124 @@ def simulate_overprint_on_cmyk(cmyk_arr, page, doc, active_channels=None):
 
             region = result[y0:y1, x0:x1]
 
-            op_fill = op.get('overprint_fill')
-            op_stroke = op.get('overprint_stroke')
-            is_overprint = bool(op_fill or op_stroke)
+            op_fill = bool(op.get('overprint_fill'))
+            op_stroke = bool(op.get('overprint_stroke'))
+            # A fill operation is only overprint when its FILL overprint flag
+            # (/OP) is set; a stroke overprint flag (/op) is meaningless for a
+            # fill. Likewise a stroke operation only overprints on /op. Mixing
+            # the two (e.g. a filled triangle that merely carries a stroke
+            # overprint flag) would wrongly repaint the object and shift it.
+            if op['type'] == 'path_fill':
+                is_overprint = op_fill
+            elif op['type'] == 'path_stroke':
+                is_overprint = op_stroke
+            else:  # path_fs / path_b: either flag makes the op overprint
+                is_overprint = op_fill or op_stroke
+
+            # Non-overprint objects are already represented exactly by the
+            # knockout render (`cmyk_arr`), which is restored at the end via
+            # `np.maximum(result, cmyk_arr)`. Painting them here again would only
+            # re-introduce anti-aliased edge artifacts, so we skip them and let
+            # the knockout render stand. Only genuine overprint objects (whose
+            # ink must be added on top of the backdrop) are painted here.
+            if not is_overprint:
+                continue
 
             # Every painted object needs its true path geometry, not its
             # bounding box -- otherwise shapes would render as filled squares
-            # and their edges would appear shifted. Non-overprint objects are
-            # composited knockout (replace inside the shape); overprint objects
-            # are composited additively (max) so they add ink on top of the
-            # layer already built below them.
-            seqno = d.get('seqno', drawing_idx)
+            # and their edges would appear shifted. Overprint objects are
+            # composited additively (max) so they add ink on top of the layer
+            # already built below them.
             region_w = x1 - x0
             region_h = y1 - y0
+
+            # Coverage mask: the object's OWN shape from the geometry (so it is
+            # isolated from overlapping objects), intersected with where real
+            # ink actually exists in the knockout. This prevents the mask from
+            # over-covering the background while still being the correct shape,
+            # so an object's ink is only ever painted at its true position.
+            seqno = d.get('seqno', drawing_idx)
             cache_key = (id(doc), page.xref, seqno, region_w, region_h)
             mask = _drawing_coverage_mask(
                 d, zoom, cache_key, target_w=region_w, target_h=region_h)
             if mask is not None:
-                # The mask is rendered at the same zoom, so its pixel grid
-                # matches cmyk_arr: mask[y, x] maps to global page pixel
-                # (y0 + y, x0 + x). Crop to the exact region and pad if the
-                # rounded mask is one pixel smaller than the region slice.
                 cov = mask[0:region_h, 0:region_w]
                 if cov.shape[0] < region_h or cov.shape[1] < region_w:
                     padded = np.zeros((region_h, region_w), dtype=np.float32)
                     padded[0:cov.shape[0], 0:cov.shape[1]] = cov
                     cov = padded
             else:
-                cov = 1.0
+                cov = np.ones((region_h, region_w), dtype=np.float32)
+
+            # The geometry comes from get_cdrawings() (always correct). The
+            # color can come from two sources that must agree:
+            #   * the parsed content stream (fg) -- the object's true stored
+            #     CMYK, needed so genuine overprint is simulated correctly;
+            #   * the knockout render (cmyk_arr) sampled at this exact geometry
+            #     -- always correct in both color and position.
+            # The content-stream <-> drawing index correlation can drift (images,
+            # Form XObjects, clip paths, paint-order differences), which would
+            # paint an object's ink onto the wrong geometry and make vector
+            # elements (e.g. arrows) "jump". Detect that: if the parsed color
+            # disagrees with the true knockout ink here, the correlation is off,
+            # so fall back to the knockout ink (correct position, no jump). When
+            # they agree, the parsed color is used (so overprint is simulated).
+            src = cmyk_arr[y0:y1, x0:x1].astype(np.float32)
+
+            # Tighten the geometry mask with the real ink: only paint where the
+            # object's shape AND actual knockout ink coincide (small tolerance
+            # for anti-aliased edges). This avoids over-coverage of background.
+            _INK_THR = 8.0
+            ink = src.reshape(-1, 4).max(axis=1).reshape(src.shape[0], src.shape[1])
+            ink_mask = (ink > _INK_THR).astype(np.float32)
+            cov = cov * ink_mask
+
+            masked = src[cov > 0.5]
+            if masked.size:
+                obj_ink = masked.reshape(-1, 4).max(axis=0)
+            else:
+                obj_ink = np.zeros(4, dtype=np.float32)
+
+            fg = np.zeros(4, dtype=np.float32)
+            for ch in range(4):
+                fc_v = float(fc[ch]) * 255.0 if (op_fill and fc and len(fc) >= 4) else 0.0
+                sc_v = float(sc[ch]) * 255.0 if (op_stroke and sc and len(sc) >= 4) else 0.0
+                fg[ch] = max(fc_v, sc_v)
+
+            # Correlation is trustworthy when the parsed color actually matches
+            # the ink present in the knockout at this geometry. Tolerate small
+            # ICC/anti-alias rounding; gross mismatches (e.g. black vs orange)
+            # indicate a drifted index, in which case we fall back to the true
+            # knockout ink so the object stays at its correct position (no jump).
+            _TOL = 70.0
+            if obj_ink.max() < 5.0:
+                # No real ink here in the knockout: never invent phantom ink,
+                # just leave the region as-is (restored from knockout later).
+                fg = np.zeros(4, dtype=np.float32)
+            else:
+                mismatch = any(abs(fg[ch] - obj_ink[ch]) > _TOL
+                              for ch in range(4))
+                if mismatch:
+                    fg = obj_ink.copy()
 
             for ch in range(4):
-                fc_v = float(fc[ch]) * 255.0 if (fc and len(fc) >= 4) else 0.0
-                sc_v = float(sc[ch]) * 255.0 if (sc and len(sc) >= 4) else 0.0
-                fg = max(fc_v, sc_v)
-                if fg <= 0:
+                if fg[ch] <= 0:
                     continue
-                if is_overprint:
-                    np.maximum(region[:, :, ch], fg * cov,
-                               out=region[:, :, ch])
-                else:
-                    region[:, :, ch] = fg * cov + region[:, :, ch] * (1.0 - cov)
+                np.maximum(region[:, :, ch], fg[ch] * cov,
+                           out=region[:, :, ch])
+
+        elif op['type'] == 'xobject':
+            # Image / Form XObject placement. It occupies drawing slot(s) in
+            # get_cdrawings() but is not painted here (raster content is
+            # restored by the final max with the knockout render). Advance the
+            # drawing index so the path<->drawing correlation stays aligned.
+            # Images map to a single drawing; Form XObjects are expanded by
+            # get_cdrawings() into their own path drawings -- for those we
+            # consume one slot here and rely on their paths being parsed
+            # separately (see _parse_content_sequence).
+            if drawing_idx < len(drawings):
+                drawing_idx += 1
+            continue
 
         elif op['type'] == 'text':
             fc = op.get('fill_color')
@@ -776,11 +874,10 @@ def build_overprint_position_map(doc, page):
         return []
 
     try:
-        # Keep only drawings that actually paint (fill or stroke). Clip-only
-        # paths (e.g. ``re W n``) are returned by get_cdrawings() but do not
-        # consume a paint-operation slot in the parser, so without this filter
-        # the parser<->drawing index correlation drifts and overprint flags get
-        # attributed to the wrong geometry.
+        # Keep only drawings that actually paint (fill/stroke color present);
+        # clip-only paths have both None and must not consume a paint-operation
+        # slot in the parser (otherwise the parser<->drawing index correlation
+        # drifts and overprint flags get attributed to the wrong geometry).
         raw_drawings = page.get_cdrawings()
         drawings = [d for d in raw_drawings
                     if d.get('fill') is not None or d.get('stroke') is not None]
@@ -818,17 +915,21 @@ def build_overprint_position_map(doc, page):
             else:
                 bbox = (r[0], r[1], r[2], r[3])
 
-            op_fill = op.get('overprint_fill', False)
-            op_stroke = op.get('overprint_stroke', False)
+            op_fill = bool(op.get('overprint_fill', False))
+            op_stroke = bool(op.get('overprint_stroke', False))
 
-            # Keep BOTH flags exactly as resolved from the applied ExtGState.
-            # This is intentionally NOT filtered by operation type so that it
-            # stays consistent with get_page_overprint() (which counts an op
-            # whenever its overprint fill/stroke flag is active). A fill-only
-            # object that has the stroke-overprint flag set will therefore
-            # report "Stroke" on hover, matching the page-level "Yes — N
-            # stroke" summary.
-            if op_fill or op_stroke:
+            # Only the flag matching the operation type makes the object
+            # genuinely overprint at that position: a fill op overprints on /OP,
+            # a stroke op on /op. A filled path that merely carries a stroke
+            # overprint flag is not overprinting its fill, so it must not be
+            # reported here (this also keeps it out of cursor hover results).
+            if op['type'] == 'path_fill':
+                is_op = op_fill
+            elif op['type'] == 'path_stroke':
+                is_op = op_stroke
+            else:
+                is_op = op_fill or op_stroke
+            if is_op:
                 # Filter out entries with bbox covering >50% of page area
                 # (e.g. combined trim marks or registration mark groups)
                 bw = bbox[2] - bbox[0]
