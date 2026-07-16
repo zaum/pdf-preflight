@@ -850,7 +850,11 @@ def get_page_overprint(doc, page):
     for o in ops:
         if o.get('overprint_fill'):
             fill += 1
-        if o.get('overprint_stroke'):
+        # A stroke overprint flag (/op) is only effective where an actual
+        # stroke is painted. Fill (f/F/f*) and text (Tj/TJ) operations have no
+        # stroke, so a carried /op flag there is meaningless and must not be
+        # counted as stroke overprint.
+        if o.get('overprint_stroke') and o['type'] in ('path_stroke', 'path_fs'):
             stroke += 1
     res = (bool(fill or stroke), fill, stroke)
     _OP_CACHE[key] = res
@@ -938,16 +942,30 @@ def build_overprint_position_map(doc, page):
                 ph = page.rect.height
                 if bw * bh > 0.5 * pw * ph:
                     continue
+                # Report only the flag that actually applies to this operation
+                # type: a fill op (/f, /f*, /F) can only overprint its fill via
+                # /OP, so a carried /op (stroke) flag is meaningless here and
+                # must not be reported as stroke overprint. Likewise a stroke
+                # op (/S, /s) only overprints via /op. This keeps cursor hover
+                # and the overprint map honest about what is really overprinting.
+                if op['type'] == 'path_fill':
+                    rep_fill, rep_stroke = op_fill, False
+                elif op['type'] == 'path_stroke':
+                    rep_fill, rep_stroke = False, op_stroke
+                else:  # path_fs / path_b: both flags apply
+                    rep_fill, rep_stroke = op_fill, op_stroke
                 result.append({
                     'bbox': bbox,
-                    'op_fill': op_fill,
-                    'op_stroke': op_stroke,
+                    'op_fill': rep_fill,
+                    'op_stroke': rep_stroke,
                 })
 
         elif op['type'] == 'text':
-            op_fill = op.get('overprint_fill', False)
-            op_stroke = op.get('overprint_stroke', False)
-            if not (op_fill or op_stroke):
+            # Text is always painted as a fill (no stroke), so the /op (stroke)
+            # overprint flag is never effective for text.
+            op_fill = bool(op.get('overprint_fill', False))
+            op_stroke = False
+            if not op_fill:
                 continue
             if text_idx < len(text_spans):
                 span = text_spans[text_idx]

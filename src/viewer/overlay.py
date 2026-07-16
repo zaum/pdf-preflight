@@ -40,7 +40,7 @@ def _format_box_dims(box, unit):
 
 
 def draw_box(painter, box, zoom, page_height, color, style, label=None,
-             x_offset=0, unit="mm", label_gap=8):
+             x_offset=0, unit="mm", label_gap=22):
     if box.x0 >= box.x1 or box.y0 >= box.y1:
         return
 
